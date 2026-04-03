@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rokit
+        uses: CompeyDev/setup-rokit@v0.1.0
+
+      - name: Setup pesde
+        uses: axiom-co/setup-pesde@v0.4.1
+
+      - name: Install dependencies
+        run: pesde install
+
+      - name: Build model
+        run: lune run build
+
+      - name: Upload model
+        run: gh release upload ${{ github.event.release.tag_name }} release/BTree.rbxm
+
+      - name: Publish package
+        run: pesde publish
+        env:
+          PESDE_TOKEN: ${{ secrets.PESDE_TOKEN }}

@@ -1,0 +1,6 @@
+{
+	"name": "BTree",
+	"tree": {
+		"$path": "lib/behaviorTree"
+	}
+}
