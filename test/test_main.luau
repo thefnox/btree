@@ -21,5 +21,6 @@ local tests = tiniest.collect_tests(function()
 
     describe_from_file("tiniest")
     describe_from_file("behaviorTree")
+    describe_from_file("serializeBlackboard")
 end)
 tiniest.run_tests(tests, {})

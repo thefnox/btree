@@ -22,6 +22,7 @@
 --   local tree = BT.new(definition, blackboard, true)
 
 local nativeBT = require("@self/behaviorTree")
+local serializeBlackboard = require("@self/serializeBlackboard")
 
 -- Re-export all types from the native library (Luau does not automatically redirect them)
 export type Status = nativeBT.Status
@@ -56,32 +57,6 @@ for key, value in nativeBT do
     Wrapper[key] = value
 end
 
--- Produces a BindableEvent-safe copy of the blackboard.
--- BindableEvent silently drops Instance values inside table arguments, so we
--- replace them with a human-readable "ClassName Name" string. Functions and
--- threads are skipped entirely. Everything else (primitives, Vector3, CFrame,
--- Color3, etc.) is kept as-is since BindableEvent supports those types.
--- The internal _debugName key is excluded from the output.
-local function serializeBlackboard(bb: any): { [string]: any }
-    local result: { [string]: any } = {}
-    for k, v in bb do
-        local key = tostring(k)
-        if key == "_debugName" then
-            continue
-        end
-        local vKind = type(v)
-        if vKind == "function" or vKind == "thread" then
-            continue
-        end
-        if typeof(v) == "Instance" then
-            local inst = v :: Instance
-            result[key] = inst.ClassName .. " " .. inst.Name
-        else
-            result[key] = v
-        end
-    end
-    return result
-end
 
 -- Override new to intercept update() and fire the BindableEvent when debug is enabled.
 function Wrapper.new(definition, blackboard, debug)
