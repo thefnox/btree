@@ -1,5 +1,5 @@
 name = "thefnox/btree"
-version = "0.1.1"
+version = "0.1.2"
 description = "A behavior tree library"
 authors = ["fnox"]
 license = "MIT"
