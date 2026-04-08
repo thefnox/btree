@@ -4,14 +4,16 @@
 -- threads are skipped entirely. Everything else (primitives, Vector3, CFrame,
 -- Color3, etc.) is kept as-is since BindableEvent supports those types.
 -- The internal _debugName key is excluded from the output.
--- Nested tables are recursively serialized. Cyclical references (e.g. a shared
--- blackboard whose members each hold a back-reference to the same blackboard)
--- are replaced with the string "[Circular]" so BindableEvent never sees them.
+-- Nested tables are serialized only one level deep. Deeper tables fall back to
+-- tostring(table) so changes in table identity remain visible across ticks.
+-- Cyclical references (e.g. a shared blackboard whose members each hold a
+-- back-reference to the same blackboard) are replaced with the string
+-- "[Circular]" so BindableEvent never sees them.
 
 local function serializeBlackboard(bb: any): { [string]: any }
 	local visited: { [any]: boolean } = {}
 
-	local function serialize(tbl: any): { [string]: any }
+	local function serialize(tbl: any, depth: number): { [string]: any }
 		if visited[tbl] then
 			return "[Circular]" :: any
 		end
@@ -29,9 +31,15 @@ local function serializeBlackboard(bb: any): { [string]: any }
 			end
 			if typeof(v) == "Instance" then
 				local inst = v :: Instance
-				result[key] = inst.ClassName .. " " .. inst.Name
+				result[key] = `({inst.ClassName}) {inst:GetFullName()}`
 			elseif vKind == "table" then
-				result[key] = serialize(v)
+				if visited[v] then
+					result[key] = "[Circular]"
+				elseif depth >= 1 then
+					result[key] = tostring(v)
+				else
+					result[key] = serialize(v, depth + 1)
+				end
 			else
 				result[key] = v
 			end
@@ -40,7 +48,7 @@ local function serializeBlackboard(bb: any): { [string]: any }
 		return result
 	end
 
-	return serialize(bb)
+	return serialize(bb, 0)
 end
 
 return serializeBlackboard
