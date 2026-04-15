@@ -97,7 +97,7 @@ return {
         return BT.FAILURE
     end,
 
-    onStop = function(bb, params)
+    onExit = function(bb, params)
         bb.agent:MoveTo(bb.agent.HumanoidRootPart.Position) -- cancel
     end,
 } :: BT.Task
@@ -106,10 +106,10 @@ return {
 | Callback | When it fires |
 |---|---|
 | `onEnter` | First tick this node is reached after not being reached last tick |
-| `onLeave` | First tick this node is *not* reached after being reached last tick |
-| `onStart` | When the task first becomes active |
-| `onStop` | When the task exits (any status) or is interrupted |
-| `run` | Every tick while active — return `SUCCESS`/`FAILURE` or nothing to keep `RUNNING` |
+| `onExit` | When a previously reached task is no longer active, including `tree:stop()` |
+| `onStart` | When a fresh execution of the task begins |
+| `onEnd` | When the task exits with `SUCCESS` or `FAILURE` |
+| `run` | Every tick while active — return `RUNNING` to stay active, `FAILURE` to fail, or nothing / `SUCCESS` to succeed |
 
 ### Subtrees
 
@@ -157,7 +157,8 @@ return BT.sequence({
 
 ```lua
 tree:update()           -- tick once, returns (Status, DebugSnapshot?)
-tree:stop()             -- immediately interrupt all active tasks
+tree:reset()            -- rewind runtime state to the root without firing interruption callbacks
+tree:stop()             -- fire onExit for active tasks, rewind, and resume so the next update starts at the root
 tree:pause()            -- suspend ticking
 tree:resume()           -- resume ticking
 tree:isPaused()         -- returns boolean
