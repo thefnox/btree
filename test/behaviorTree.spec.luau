@@ -132,6 +132,20 @@ return function(tiniest: tiniest_actual)
 			expect(received).is(params)
 		end)
 
+		test("defaults nil params to an empty table", function()
+			local received: any = nil
+			local def = BT.task({
+				run = function(_, p)
+					received = p
+					return SUCCESS
+				end,
+			}, nil)
+			BT.new(def, {}):update()
+			expect(type(def.params)).is("table")
+			expect(next(def.params)).is(nil)
+			expect(received).is(def.params)
+		end)
+
 		test("passes blackboard to onStart and onEnd", function()
 			local bb = { marker = true }
 			local startBb: any = nil

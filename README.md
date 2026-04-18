@@ -192,6 +192,8 @@ Debug mode adds no overhead when disabled (`false` / `nil`).
 
 When a task module declares a `params` schema, `BT.task()` validates the values passed at definition time. Supported type strings:
 
+Omitted or `nil` task params are normalized to an empty table before being stored on the task definition and passed to task hooks.
+
 - Lua primitives: `"number"`, `"string"`, `"boolean"`
 - Roblox types: `"Vector2"`, `"Vector3"`, any Roblox Instance class name
 

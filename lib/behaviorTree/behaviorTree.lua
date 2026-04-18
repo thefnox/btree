@@ -92,7 +92,7 @@ type TaskModule = {
 
 type BaseDefinition = { meta: NodeMeta? }
 
-export type TaskDef = BaseDefinition & { _type: "task", module: TaskModule, params: any? }
+export type TaskDef = BaseDefinition & { _type: "task", module: TaskModule, params: any }
 export type ConditionDef = BaseDefinition & { _type: "condition", check: (blackboard: Blackboard) -> boolean }
 export type SequenceDef = BaseDefinition & { _type: "sequence", children: { NodeDefinition } }
 export type SelectorDef = BaseDefinition & { _type: "selector", children: { NodeDefinition } }
@@ -355,6 +355,9 @@ local function stopNode(nodeIndex: number, nodes: { FlatNode }, childrenData: { 
 		local def = node.definition :: TaskDef
 		if def.module.onExit then
 			def.module.onExit(blackboard, def.params)
+		end
+		if def.module.onEnd and node.activeThisTick then
+			def.module.onEnd(blackboard, def.params)
 		end
 	end
 	for i = 1, node.childCount do
@@ -949,8 +952,9 @@ function BehaviorTree.task(module: BTreeTask, params: any?, meta: NodeMeta?): Ta
 	module.run = module.run or function()
 		return SUCCESS
 	end
+	local resolvedParams = if params == nil then {} else params
 	if module.params then
-		validateTaskParams(module.params, params)
+		validateTaskParams(module.params, resolvedParams)
 	end
 	local resolvedMeta: NodeMeta? = meta
 	if module.name ~= nil and (meta == nil or meta.label == nil) then
@@ -958,7 +962,7 @@ function BehaviorTree.task(module: BTreeTask, params: any?, meta: NodeMeta?): Ta
 		withName.label = tostring(module.name)
 		resolvedMeta = withName
 	end
-	return { _type = "task", module = module :: TaskModule, params = params, meta = resolvedMeta }
+	return { _type = "task", module = module :: TaskModule, params = resolvedParams, meta = resolvedMeta }
 end
 
 function BehaviorTree.condition(check: (blackboard: Blackboard) -> boolean, meta: NodeMeta?): ConditionDef
@@ -1063,11 +1067,7 @@ export type Library = {
 	repeatNode: (child: NodeDefinition, times: number, meta: NodeMeta?) -> RepeatDef,
 	retryNode: (child: NodeDefinition, times: number, meta: NodeMeta?) -> RetryDef,
 	subtree: (module: NodeDefinition, meta: NodeMeta?) -> SubtreeDef,
-	randomSelector: (
-		children: { NodeDefinition },
-		weights: { number }?,
-		meta: NodeMeta?
-	) -> RandomSelectorDef,
+	randomSelector: (children: { NodeDefinition }, weights: { number }?, meta: NodeMeta?) -> RandomSelectorDef,
 }
 
 return BehaviorTree :: Library
