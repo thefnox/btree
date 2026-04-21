@@ -32,8 +32,8 @@
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
-local serializeBlackboard = require("@self/serializeBlackboard")
-local debugCodec = require("@self/debugCodec")
+local serializeBlackboard = require("./serializeBlackboard")
+local debugCodec = require("./debugCodec")
 
 local IS_SERVER = RunService:IsServer()
 
