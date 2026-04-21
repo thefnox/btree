@@ -875,6 +875,356 @@ return function(tiniest: tiniest_actual)
 	end)
 
 	------------------------------------------------------------------------
+	-- per-frame execution trace
+	--
+	-- These tests guarantee that the debug callback produces a complete trace
+	-- every frame: every node visited during a tick shows up in the accumulator
+	-- with its terminal status for that tick. This is the invariant the Roblox
+	-- wrapper (init.lua) relies on when it assembles the BTDebugSnapshot
+	-- payload with `nodeStates[nodeIndex] = status`.
+	--
+	-- Covers:
+	--   - long-running tasks that return RUNNING across many frames
+	--   - single frames where many nodes succeed/fail before the tree settles
+	--   - selector/sequence fall-through (short-circuit) bookkeeping
+	--   - yielding tasks whose run() spans a scheduler step
+	------------------------------------------------------------------------
+
+	describe("per-frame execution trace", function()
+		-- Mirrors the wrapper's accumulator in init.lua so these tests prove
+		-- the exact pipeline the debug event fires each frame. Returns the
+		-- accumulated {nodeIndex = status} map and the ordered list of
+		-- (node, status) pairs as emitted by the callback.
+		local function tickWithTrace(tree: BT.Tree)
+			local nodeStates: { [number]: BT.Status } = {}
+			local events: { { node: number, status: BT.Status } } = {}
+			local status, snap = tree:update(function(nodeIndex, s)
+				nodeStates[nodeIndex] = s
+				table.insert(events, { node = nodeIndex, status = s })
+			end)
+			return { nodeStates = nodeStates, events = events, status = status, snap = snap }
+		end
+
+		test("captures every visited node with its terminal status when all children succeed in one frame", function()
+			-- Sequence(1) -> task(2), task(3), task(4) with all three succeeding
+			-- within a single tick. All four DFS indices must appear in the
+			-- accumulator with SUCCESS.
+			local tree = BT.new(BT.sequence({ BT.task(SUCCEED), BT.task(SUCCEED), BT.task(SUCCEED) }), {}, true)
+			local frame = tickWithTrace(tree)
+			expect(frame.status).is(SUCCESS)
+			expect(frame.nodeStates[1]).is(SUCCESS)
+			expect(frame.nodeStates[2]).is(SUCCESS)
+			expect(frame.nodeStates[3]).is(SUCCESS)
+			expect(frame.nodeStates[4]).is(SUCCESS)
+		end)
+
+		test("captures each completion when a selector falls through multiple failing children before succeeding", function()
+			-- Selector(1) -> task FAIL (2), task FAIL (3), task SUCCEED (4).
+			-- All three children are visited in a single tick; their
+			-- terminal statuses must all be present alongside the selector's
+			-- SUCCESS.
+			local tree = BT.new(BT.selector({ BT.task(FAIL), BT.task(FAIL), BT.task(SUCCEED) }), {}, true)
+			local frame = tickWithTrace(tree)
+			expect(frame.status).is(SUCCESS)
+			expect(frame.nodeStates[1]).is(SUCCESS)
+			expect(frame.nodeStates[2]).is(FAILURE)
+			expect(frame.nodeStates[3]).is(FAILURE)
+			expect(frame.nodeStates[4]).is(SUCCESS)
+		end)
+
+		test("does not include nodes that were short-circuited away in a sequence", function()
+			-- Sequence(1) -> task FAIL (2), task SUCCEED (3). Node 3 must not
+			-- appear in the trace because the sequence bailed on node 2.
+			local tree = BT.new(BT.sequence({ BT.task(FAIL), BT.task(SUCCEED) }), {}, true)
+			local frame = tickWithTrace(tree)
+			expect(frame.status).is(FAILURE)
+			expect(frame.nodeStates[1]).is(FAILURE)
+			expect(frame.nodeStates[2]).is(FAILURE)
+			expect(frame.nodeStates[3]).never_exists()
+		end)
+
+		test("does not include nodes that were short-circuited away in a selector", function()
+			-- Selector(1) -> task SUCCEED (2), task SUCCEED (3). Node 3 must
+			-- not appear in the trace because the selector bailed on node 2.
+			local tree = BT.new(BT.selector({ BT.task(SUCCEED), BT.task(SUCCEED) }), {}, true)
+			local frame = tickWithTrace(tree)
+			expect(frame.status).is(SUCCESS)
+			expect(frame.nodeStates[1]).is(SUCCESS)
+			expect(frame.nodeStates[2]).is(SUCCESS)
+			expect(frame.nodeStates[3]).never_exists()
+		end)
+
+		test("long-running task: records RUNNING for every active node on every frame", function()
+			-- Sequence(1) -> task SUCCEED (2), long-running task (3). Once
+			-- the sequence settles onto the long task, every subsequent
+			-- frame must record sequence + running task (and never omit them).
+			local tickCount = 0
+			local longTask: BT.BTreeTask = {
+				run = function()
+					tickCount += 1
+					return if tickCount < 5 then RUNNING else SUCCESS
+				end,
+			}
+			local tree = BT.new(BT.sequence({ BT.task(SUCCEED), BT.task(longTask) }), {}, true)
+
+			-- Frame 1: task(2) succeeds, task(3) first tick — must include all three.
+			local f1 = tickWithTrace(tree)
+			expect(f1.status).is(RUNNING)
+			expect(f1.nodeStates[1]).is(RUNNING)
+			expect(f1.nodeStates[2]).is(SUCCESS)
+			expect(f1.nodeStates[3]).is(RUNNING)
+
+			-- Frames 2..4: the sequence parks on task(3). Task(2) has already
+			-- succeeded and is not re-ticked, so it must NOT appear — but
+			-- sequence(1) and task(3) MUST appear each frame with RUNNING.
+			for _ = 2, 4 do
+				local f = tickWithTrace(tree)
+				expect(f.status).is(RUNNING)
+				expect(f.nodeStates[1]).is(RUNNING)
+				expect(f.nodeStates[2]).never_exists()
+				expect(f.nodeStates[3]).is(RUNNING)
+			end
+
+			-- Final frame: task(3) terminates with SUCCESS. Sequence settles.
+			local fLast = tickWithTrace(tree)
+			expect(fLast.status).is(SUCCESS)
+			expect(fLast.nodeStates[1]).is(SUCCESS)
+			expect(fLast.nodeStates[2]).never_exists()
+			expect(fLast.nodeStates[3]).is(SUCCESS)
+		end)
+
+		test("selector fall-through: frame 1 visits everything, frame 2 only the running branch", function()
+			-- Shape approximates the user's tree: selector of three sequences,
+			-- the first two fail fast, the third parks on a long-running task.
+			--
+			-- Layout of DFS indices:
+			--   1  selector
+			--   2    sequence#1
+			--   3      task FAIL     (guard fails)
+			--   4    sequence#2
+			--   5      task FAIL     (guard fails)
+			--   6    sequence#3
+			--   7      long-running task
+			local longTickCount = 0
+			local longTask: BT.BTreeTask = {
+				run = function()
+					longTickCount += 1
+					return if longTickCount < 3 then RUNNING else SUCCESS
+				end,
+			}
+			local tree = BT.new(
+				BT.selector({
+					BT.sequence({ BT.task(FAIL) }),
+					BT.sequence({ BT.task(FAIL) }),
+					BT.sequence({ BT.task(longTask) }),
+				}),
+				{},
+				true
+			)
+
+			-- Frame 1: every node along the path must be present.
+			local f1 = tickWithTrace(tree)
+			expect(f1.status).is(RUNNING)
+			expect(f1.nodeStates[1]).is(RUNNING)
+			expect(f1.nodeStates[2]).is(FAILURE)
+			expect(f1.nodeStates[3]).is(FAILURE)
+			expect(f1.nodeStates[4]).is(FAILURE)
+			expect(f1.nodeStates[5]).is(FAILURE)
+			expect(f1.nodeStates[6]).is(RUNNING)
+			expect(f1.nodeStates[7]).is(RUNNING)
+
+			-- Frame 2: selector parks on sequence#3, so only nodes 1, 6, 7
+			-- should appear. The previously-failed branches must not leak
+			-- into this frame's trace.
+			local f2 = tickWithTrace(tree)
+			expect(f2.nodeStates[1]).is(RUNNING)
+			expect(f2.nodeStates[2]).never_exists()
+			expect(f2.nodeStates[3]).never_exists()
+			expect(f2.nodeStates[4]).never_exists()
+			expect(f2.nodeStates[5]).never_exists()
+			expect(f2.nodeStates[6]).is(RUNNING)
+			expect(f2.nodeStates[7]).is(RUNNING)
+
+			-- Frame 3: the long task succeeds, so sequence#3 and the
+			-- selector both settle. Still only the active branch appears.
+			local f3 = tickWithTrace(tree)
+			expect(f3.status).is(SUCCESS)
+			expect(f3.nodeStates[1]).is(SUCCESS)
+			expect(f3.nodeStates[2]).never_exists()
+			expect(f3.nodeStates[3]).never_exists()
+			expect(f3.nodeStates[4]).never_exists()
+			expect(f3.nodeStates[5]).never_exists()
+			expect(f3.nodeStates[6]).is(SUCCESS)
+			expect(f3.nodeStates[7]).is(SUCCESS)
+		end)
+
+		test("each callback invocation is paired (RUNNING before, terminal after) for every visited node", function()
+			-- Selector of a failing branch and a succeeding branch. For every
+			-- visited node we expect exactly one RUNNING "enter" event and
+			-- exactly one "exit" event carrying its terminal status.
+			local tree = BT.new(
+				BT.selector({
+					BT.sequence({ BT.task(FAIL), BT.task(SUCCEED) }),
+					BT.sequence({ BT.task(SUCCEED), BT.task(SUCCEED) }),
+				}),
+				{},
+				true
+			)
+			local frame = tickWithTrace(tree)
+
+			local enters: { [number]: number } = {}
+			local exits: { [number]: BT.Status } = {}
+			for _, ev in frame.events do
+				if enters[ev.node] == nil then
+					-- First event for this node must be RUNNING (the "before" call).
+					expect(ev.status).is(RUNNING)
+					enters[ev.node] = 1
+				else
+					-- Second event for this node is its terminal status.
+					expect(exits[ev.node]).never_exists()
+					exits[ev.node] = ev.status
+				end
+			end
+
+			-- Every node that was entered must also have been exited.
+			for node in enters do
+				expect(exits[node]).exists()
+				-- The terminal status recorded in the events log must match
+				-- what the accumulator saved for the snapshot.
+				expect(exits[node]).is(frame.nodeStates[node])
+			end
+
+			-- Node indices that must have been visited: selector(1),
+			-- sequence#1(2), task-FAIL(3), sequence#2(5), task-SUCCEED(6),
+			-- task-SUCCEED(7). Node 4 (the second task of the failing
+			-- sequence) must NOT be visited.
+			for _, idx in { 1, 2, 3, 5, 6, 7 } do
+				expect(enters[idx]).exists()
+				expect(exits[idx]).exists()
+			end
+			expect(enters[4]).never_exists()
+			expect(exits[4]).never_exists()
+		end)
+
+		test("repeated node: each internal iteration only contributes one terminal status per frame", function()
+			-- repeat(3) -> task SUCCEED. The child succeeds once per tick. The
+			-- accumulator must still report the child's final status on every
+			-- tick — never an intermediate or stale value.
+			local tree = BT.new(BT.repeatNode(BT.task(SUCCEED), 3), {}, true)
+
+			for _ = 1, 2 do
+				local f = tickWithTrace(tree)
+				expect(f.status).is(RUNNING)
+				expect(f.nodeStates[1]).is(RUNNING) -- repeat still pending
+				expect(f.nodeStates[2]).is(SUCCESS) -- child completed this tick
+			end
+
+			local fLast = tickWithTrace(tree)
+			expect(fLast.status).is(SUCCESS)
+			expect(fLast.nodeStates[1]).is(SUCCESS)
+			expect(fLast.nodeStates[2]).is(SUCCESS)
+		end)
+
+		test("parallel: every child visited in a frame appears in the trace", function()
+			-- Parallel(1) with three children, two succeed, one fails. With
+			-- the default requireOne failure policy the parallel terminates
+			-- this tick. All three children are ticked in this frame and must
+			-- appear in the trace alongside the parallel itself.
+			local tree = BT.new(BT.parallel({ BT.task(SUCCEED), BT.task(FAIL), BT.task(SUCCEED) }), {}, true)
+			local frame = tickWithTrace(tree)
+			expect(frame.nodeStates[1]).exists()
+			expect(frame.nodeStates[2]).is(SUCCESS)
+			expect(frame.nodeStates[3]).is(FAILURE)
+			expect(frame.nodeStates[4]).is(SUCCESS)
+		end)
+
+		test("trace is complete across a task.wait() yield inside run()", function()
+			-- A yielding run() suspends tree:update() between the "before" and
+			-- "after" callback calls. After the scheduler resumes, the trace
+			-- must still contain both halves — the sequence's enter, the
+			-- task's enter and terminal status, and the sequence's exit.
+			local captured: { nodeStates: { [number]: BT.Status }?, events: any } = { nodeStates = nil, events = nil }
+			local resultStatus: BT.Status = BT.RUNNING
+
+			task.spawn(function()
+				local tree = BT.new(
+					BT.sequence({
+						BT.task({
+							run = function()
+								task.wait(YIELD_DUR)
+								return BT.SUCCESS
+							end,
+						}),
+					}),
+					{},
+					true
+				)
+				local frame = tickWithTrace(tree)
+				captured.nodeStates = frame.nodeStates
+				captured.events = frame.events
+				resultStatus = frame.status
+			end)
+
+			-- Before the yield resolves the coroutine is parked inside run().
+			-- The trace should have only the "enters" so far.
+			expect(captured.nodeStates).never_exists()
+
+			task.wait(SYNC_DUR)
+
+			expect(resultStatus).is(BT.SUCCESS)
+			expect(captured.nodeStates).exists()
+			expect(captured.nodeStates[1]).is(SUCCESS) -- sequence
+			expect(captured.nodeStates[2]).is(SUCCESS) -- task
+		end)
+
+		test("full trace of a repeated failure-then-rerun across frames preserves every node each frame", function()
+			-- A sequence with a guard that fails the first tick and succeeds
+			-- thereafter. Frame 1: guard(3) fails so sequence(2) fails; the
+			-- selector(1) keeps searching. Frame 2: guard now succeeds, so
+			-- the sequence goes all the way through. In both frames the trace
+			-- must include every node that was actually visited that frame.
+			local guardSucceeds = false
+			local guardFiredOnce = false
+			local guard: BT.BTreeTask = {
+				run = function()
+					if not guardFiredOnce then
+						guardFiredOnce = true
+						return FAILURE
+					end
+					return if guardSucceeds then SUCCESS else FAILURE
+				end,
+			}
+
+			local tree = BT.new(
+				BT.selector({
+					BT.sequence({ BT.task(guard), BT.task(SUCCEED) }),
+					BT.task(SUCCEED),
+				}),
+				{},
+				true
+			)
+
+			local f1 = tickWithTrace(tree)
+			expect(f1.status).is(SUCCESS)
+			expect(f1.nodeStates[1]).is(SUCCESS) -- selector
+			expect(f1.nodeStates[2]).is(FAILURE) -- sequence#1
+			expect(f1.nodeStates[3]).is(FAILURE) -- guard
+			expect(f1.nodeStates[4]).never_exists() -- sibling inside sequence#1 was short-circuited
+			expect(f1.nodeStates[5]).is(SUCCESS) -- fallback task
+
+			-- Flip the guard so the first branch wins on the next frame.
+			guardSucceeds = true
+			local f2 = tickWithTrace(tree)
+			expect(f2.status).is(SUCCESS)
+			expect(f2.nodeStates[1]).is(SUCCESS)
+			expect(f2.nodeStates[2]).is(SUCCESS)
+			expect(f2.nodeStates[3]).is(SUCCESS)
+			expect(f2.nodeStates[4]).is(SUCCESS)
+			expect(f2.nodeStates[5]).never_exists() -- selector short-circuited after sequence#1 succeeded
+		end)
+	end)
+
+	------------------------------------------------------------------------
 	-- definition cache
 	------------------------------------------------------------------------
 

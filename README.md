@@ -212,6 +212,43 @@ type NodeMeta = {
     position: Vector2?,
 }
 ```
+
+
+### Remote debugging
+
+In addition to the in-process `BTDebugSnapshot` BindableEvent, the server exposes three buffer-based RemoteEvents so clients can observe any tree created with debugging enabled. The RemoteEvents are lazily parented under the library script the first time a debug-enabled tree is registered, so non-debug builds carry no remote-event overhead.
+
+| RemoteEvent | Direction | Payload |
+|---|---|---|
+| `DebugTreeList` | Client → Server (request), Server → Client (response) | Client fires an empty buffer; server replies with `u16 count` followed by `{u32 id, u32 executionCount, u16 nameLen, name, u16 pathLen, path}` per tree. |
+| `DebugSubscribe` | Client → Server | Buffer: `u32 treeId, u8 subscribe` (1 to start, 0 to stop). |
+| `DebugSnapshot` | Server → Client | Buffer: `u8 kind` (0=full, 1=delta), `u32 treeId`, `u32 tick`, `u8 paused`, node-state entries, then blackboard entries. |
+
+The first snapshot a subscriber receives is a full packet containing every node state and the complete serialized blackboard. Each subsequent packet is a delta containing only the node states that changed and the blackboard keys that were set or removed.
+
+Decoder helpers are available on the `debugNetwork` submodule:
+
+```lua
+local debugNetwork = require(path.to.BehaviorTree.debugNetwork)
+
+-- Client-side
+local remotes = debugNetwork.waitForRemotes()
+remotes.treeList.OnClientEvent:Connect(function(buf)
+    for _, entry in debugNetwork.decodeTreeList(buf) do
+        print(entry.id, entry.debugName, entry.executionCount)
+    end
+end)
+remotes.treeList:FireServer() -- request the list
+
+remotes.snapshot.OnClientEvent:Connect(function(buf)
+    local packet = debugNetwork.decodeSnapshot(buf)
+    -- packet.kind == "full" | "delta"
+    -- packet.nodeStates, packet.blackboardSet, packet.blackboardRemoved
+end)
+
+remotes.subscribe:FireServer(debugNetwork.encodeSubscribe(treeId, true))
+```
+
 ## License
 
 MIT

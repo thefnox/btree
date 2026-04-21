@@ -23,6 +23,7 @@
 
 local nativeBT = require("@self/behaviorTree")
 local serializeBlackboard = require("@self/serializeBlackboard")
+local debugNetwork = require("@self/debugNetwork")
 
 -- Re-export all types from the native library (Luau does not automatically redirect them)
 export type Status = nativeBT.Status
@@ -67,10 +68,14 @@ function Wrapper.new(definition, blackboard, debug)
 
     local tree = nativeBT.new(definition, blackboard, debug ~= nil and debug ~= false)
 
-    if debug and event then
+    if debug then
         local debugName = if type(blackboard) == "table" and blackboard._debugName
             then tostring(blackboard._debugName)
             else tostring(blackboard)
+
+        -- Register with the network-debug registry so clients can discover and
+        -- subscribe to this tree. Server-only; returns 0 on the client.
+        local treeId = debugNetwork.registerTree(debugName, definitionPath)
 
         local nativeUpdate = tree.update
         tree.update = function(self)
@@ -80,13 +85,27 @@ function Wrapper.new(definition, blackboard, debug)
             end
             local status, nativeSnapshot = nativeUpdate(self, onNodeUpdate)
             local isPaused = nativeSnapshot ~= nil and nativeSnapshot.paused == true
-            if next(nodeStates) or isPaused then
+            if event and (next(nodeStates) or isPaused) then
                 event:Fire(definitionPath, debugName, {
                     tick = if nativeSnapshot then nativeSnapshot.tick else nil,
                     paused = isPaused,
                     nodeStates = nodeStates,
                     blackboard = serializeBlackboard(blackboard),
                 })
+            end
+            -- Forward the authoritative (full) snapshot to the network
+            -- debugger. `nativeSnapshot.nodeStates` holds the status of every
+            -- node — we use it rather than the ticked-only `nodeStates`
+            -- captured above so remote clients can diff against a stable
+            -- baseline.
+            if treeId ~= 0 and nativeSnapshot ~= nil then
+                debugNetwork.onTreeUpdated(
+                    treeId,
+                    nativeSnapshot.tick,
+                    isPaused,
+                    nativeSnapshot.nodeStates,
+                    blackboard
+                )
             end
             return status, nativeSnapshot
         end
