@@ -75,7 +75,9 @@ function Wrapper.new(definition, blackboard, debug)
 
         -- Register with the network-debug registry so clients can discover and
         -- subscribe to this tree. Server-only; returns 0 on the client.
-        local treeId = debugNetwork.registerTree(debugName, definitionPath)
+        -- The definition is stored so clients can request its static structure
+        -- over the DebugTreeDefinition RemoteEvent.
+        local treeId = debugNetwork.registerTree(debugName, definitionPath, definition)
 
         local nativeUpdate = tree.update
         tree.update = function(self)
