@@ -216,15 +216,42 @@ type NodeMeta = {
 
 ### Remote debugging
 
-In addition to the in-process `BTDebugSnapshot` BindableEvent, the server exposes three buffer-based RemoteEvents so clients can observe any tree created with debugging enabled. The RemoteEvents are lazily parented under the library script the first time a debug-enabled tree is registered, so non-debug builds carry no remote-event overhead.
+In addition to the in-process `BTDebugSnapshot` BindableEvent, the server exposes four buffer-based RemoteEvents so clients can observe any tree created with debugging enabled. The RemoteEvents are lazily parented under the library script the first time a debug-enabled tree is registered, so non-debug builds carry no remote-event overhead.
 
 | RemoteEvent | Direction | Payload |
 |---|---|---|
-| `DebugTreeList` | Client → Server (request), Server → Client (response) | Client fires an empty buffer; server replies with `u16 count` followed by `{u32 id, u32 executionCount, u16 nameLen, name, u16 pathLen, path}` per tree. |
+| `DebugTreeList` | Client ↔ Server | Client fires an empty buffer; server replies with `u16 count` followed by `{u32 id, u32 executionCount, len-prefixed debugName, len-prefixed definitionPath}` per tree. |
+| `DebugTreeDefinition` | Client ↔ Server | Client fires `u32 treeId`; server replies with `u32 treeId` (0 if unknown, and no further payload) followed by the encoded tree-definition packet (see below). Tree definitions don't replicate through normal Roblox replication, so this is the only way for a client to learn the tree's structure. |
 | `DebugSubscribe` | Client → Server | Buffer: `u32 treeId, u8 subscribe` (1 to start, 0 to stop). |
 | `DebugSnapshot` | Server → Client | Buffer: `u8 kind` (0=full, 1=delta), `u32 treeId`, `u32 tick`, `u8 paused`, node-state entries, then blackboard entries. |
 
 The first snapshot a subscriber receives is a full packet containing every node state and the complete serialized blackboard. Each subsequent packet is a delta containing only the node states that changed and the blackboard keys that were set or removed.
+
+**Tree-definition packet format.** To avoid hardcoding a shared type enum on both server and client, every tree-definition packet starts with a self-describing type enum. The layout is:
+
+```
+u32 treeId
+u8  typeEnumCount
+repeat typeEnumCount times: len-prefixed string   -- e.g. "task", "sequence", ...
+u32 nodeCount
+repeat nodeCount times:
+    u8  typeEnumIndex                             -- 0-based into the header above
+    u16 childCount                                -- composite children (DFS indices)
+    repeat childCount times: u32 childIndex
+    u32 singleChild                               -- decorator/subtree child, 0 if none
+    u8  hasLabel; if 1: len-prefixed string
+    u8  hasSize;  if 1: f32 x, f32 y
+    u8  hasPosition; if 1: f32 x, f32 y
+    -- type-specific payload:
+    --   task            : hasName (u8), optional len-prefixed name, u32 paramCount,
+    --                     repeat: len-prefixed key + value (tagged blackboard value)
+    --   parallel        : len-prefixed successPolicy, len-prefixed failurePolicy
+    --   repeat / retry  : i32 times (-1 = infinite)
+    --   randomSelector  : hasWeights (u8), optional u32 count + f32 weights
+    --   other types     : no extra payload
+```
+
+DFS node indices match the native library's `buildFlatTree` ordering, so they line up 1:1 with the `nodeIndex` keys used in `DebugSnapshot` packets.
 
 Decoder helpers are available on the `debugNetwork` submodule:
 
@@ -233,19 +260,31 @@ local debugNetwork = require(path.to.BehaviorTree.debugNetwork)
 
 -- Client-side
 local remotes = debugNetwork.waitForRemotes()
+
+-- List all active debug trees.
 remotes.treeList.OnClientEvent:Connect(function(buf)
     for _, entry in debugNetwork.decodeTreeList(buf) do
         print(entry.id, entry.debugName, entry.executionCount)
     end
 end)
-remotes.treeList:FireServer() -- request the list
+remotes.treeList:FireServer()
 
+-- Fetch the static structure of a tree so the client can render node graphs.
+remotes.treeDefinition.OnClientEvent:Connect(function(buf)
+    local packet = debugNetwork.decodeTreeDefinition(buf)
+    for i, node in packet.nodes do
+        -- node.type, node.children, node.singleChild, node.label,
+        -- node.taskName, node.taskParams, node.successPolicy, etc.
+    end
+end)
+remotes.treeDefinition:FireServer(debugNetwork.encodeTreeDefinitionRequest(treeId))
+
+-- Stream snapshot updates.
 remotes.snapshot.OnClientEvent:Connect(function(buf)
     local packet = debugNetwork.decodeSnapshot(buf)
     -- packet.kind == "full" | "delta"
     -- packet.nodeStates, packet.blackboardSet, packet.blackboardRemoved
 end)
-
 remotes.subscribe:FireServer(debugNetwork.encodeSubscribe(treeId, true))
 ```
 
