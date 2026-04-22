@@ -77,6 +77,18 @@ local VAL_FALLBACK: number = 9
 -- primitive values). Wrapping the lookups with `any` keeps strict mode
 -- happy on both environments.
 
+-- Deterministic string representation of a shallow serialized table (the kind
+-- produced by serializeBlackboard for depth-1 nested values). Keys are sorted
+-- so the output is stable across frames even when Lua's iteration order varies.
+-- Defined before writeValue/valuesEqual so both can reference it.
+local function serializeTableToString(t: { [string]: any }): string
+	local parts: { string } = {}
+	for k, v in t do
+		parts[#parts + 1] = k .. "=" .. tostring(v)
+	end
+	return "{" .. table.concat(parts, ", ") .. "}"
+end
+
 local function writeValue(w: Writer, value: any)
 	local t = typeof(value)
 	if t == "boolean" then
@@ -117,6 +129,12 @@ local function writeValue(w: Writer, value: any)
 		writeF32(w, r20)
 		writeF32(w, r21)
 		writeF32(w, r22)
+	elseif t == "table" then
+		-- Shallow tables come from serializeBlackboard's depth-1 recursion.
+		-- Encode as a deterministic string so the client receives readable
+		-- key=value pairs rather than an unstable "table: 0x…" address.
+		writeU8(w, VAL_STRING)
+		writeString(w, serializeTableToString(value))
 	else
 		writeU8(w, VAL_FALLBACK)
 		writeString(w, tostring(value))
@@ -160,8 +178,12 @@ local function readValue(r: Reader): any
 	error(`Unknown value tag {tag}`)
 end
 
--- Equality check used for diff tracking. Serialized blackboards only contain
--- primitives, strings, and Roblox value types — all of which support ==.
+-- Equality check used for diff tracking. Serialized blackboards contain
+-- primitives, strings, Roblox value types, and shallow tables (from
+-- serializeBlackboard depth-1 recursion). Tables are compared by their
+-- deterministic string form so two tables with the same content are equal
+-- even when they are different objects (serializeBlackboard creates a new
+-- table every frame).
 local function valuesEqual(a: any, b: any): boolean
 	if a == b then
 		return true
@@ -172,6 +194,9 @@ local function valuesEqual(a: any, b: any): boolean
 	end
 	if ta == "Vector3" or ta == "Vector2" or ta == "Color3" then
 		return a == b
+	end
+	if ta == "table" then
+		return serializeTableToString(a) == serializeTableToString(b)
 	end
 	return false
 end
@@ -737,4 +762,5 @@ return {
 	buildTreeDefinitionResponse = buildTreeDefinitionResponse,
 	buildEmptyTreeDefinitionResponse = buildEmptyTreeDefinitionResponse,
 	valuesEqual = valuesEqual,
+	serializeTableToString = serializeTableToString,
 }
