@@ -82,14 +82,9 @@ local VAL_FALLBACK: number = 9
 -- so the output is stable across frames even when Lua's iteration order varies.
 -- Defined before writeValue/valuesEqual so both can reference it.
 local function serializeTableToString(t: { [string]: any }): string
-	local keys: { string } = {}
-	for k in t do
-		keys[#keys + 1] = k
-	end
-	table.sort(keys)
 	local parts: { string } = {}
-	for _, k in keys do
-		parts[#parts + 1] = k .. "=" .. tostring(t[k])
+	for k, v in t do
+		parts[#parts + 1] = k .. "=" .. tostring(v)
 	end
 	return "{" .. table.concat(parts, ", ") .. "}"
 end
