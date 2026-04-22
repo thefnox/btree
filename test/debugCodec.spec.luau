@@ -224,6 +224,29 @@ return function(tiniest)
 		end)
 	end)
 
+	describe("pause request codec", function()
+		test("roundtrips pause=true", function()
+			local buf = codec.encodePauseRequest(42, true)
+			local parsed = codec.decodePauseRequest(buf)
+			expect(parsed ~= nil).is(true)
+			local p = parsed :: any
+			expect(p.treeId).is(42)
+			expect(p.paused).is(true)
+		end)
+
+		test("roundtrips pause=false", function()
+			local buf = codec.encodePauseRequest(99, false)
+			local parsed = codec.decodePauseRequest(buf) :: any
+			expect(parsed.treeId).is(99)
+			expect(parsed.paused).is(false)
+		end)
+
+		test("rejects short buffers", function()
+			local tiny = buffer.create(2)
+			expect(codec.decodePauseRequest(tiny) == nil).is(true)
+		end)
+	end)
+
 	describe("tree-definition request codec", function()
 		test("roundtrips treeId", function()
 			local buf = codec.encodeTreeDefinitionRequest(7)
@@ -278,7 +301,7 @@ return function(tiniest)
 			expect(decoded.paused).is(true)
 		end)
 
-		test("delta emits only changed node states", function()
+		test("delta preserves the full visited-node trace even when statuses repeat", function()
 			local frame = {
 				treeId = 1,
 				tick = 2,
@@ -286,17 +309,19 @@ return function(tiniest)
 				nodeStates = { [1] = 2, [2] = 0, [3] = 1 },
 				blackboard = {},
 			}
-			local previousNodeStates = { [1] = 2, [2] = 1, [3] = 1 } -- node 2 differs
-			local buf = codec.encodeDeltaSnapshot(frame, previousNodeStates, {})
+			local buf = codec.encodeDeltaSnapshot(frame, {})
 			local decoded = codec.decodeSnapshot(buf)
 			expect(decoded.kind).is("delta")
-			-- Only node 2 should appear; nodes 1 and 3 are unchanged.
-			local changedCount = 0
+			-- All three nodes should still appear because nodeStates represents
+			-- the full visited-node result of the last update, not a per-node diff.
+			local traceCount = 0
 			for _ in decoded.nodeStates do
-				changedCount += 1
+				traceCount += 1
 			end
-			expect(changedCount).is(1)
+			expect(traceCount).is(3)
+			expect(decoded.nodeStates[1]).is(2)
 			expect(decoded.nodeStates[2]).is(0)
+			expect(decoded.nodeStates[3]).is(1)
 		end)
 
 		test("delta emits blackboard set and remove operations", function()
@@ -311,13 +336,12 @@ return function(tiniest)
 					newKey = 42, -- new key
 				},
 			}
-			local previousNodeStates = {}
 			local previousBlackboard = {
 				alerted = false,
 				target = "A",
 				staleKey = "gone", -- should be removed
 			}
-			local buf = codec.encodeDeltaSnapshot(frame, previousNodeStates, previousBlackboard)
+			local buf = codec.encodeDeltaSnapshot(frame, previousBlackboard)
 			local decoded = codec.decodeSnapshot(buf)
 			expect(decoded.kind).is("delta")
 			expect(decoded.blackboardSet.alerted).is(true)

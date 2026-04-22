@@ -522,7 +522,6 @@ end
 
 local function encodeDeltaSnapshot(
 	frame: SnapshotFrame,
-	previousNodeStates: { [number]: number },
 	previousBlackboard: { [string]: any }
 ): buffer
 	local w = newWriter(256)
@@ -531,17 +530,18 @@ local function encodeDeltaSnapshot(
 	writeU32(w, frame.tick)
 	writeU8(w, if frame.paused then 1 else 0)
 
+	-- Node states always carry the full visited-node trace for the most recent
+	-- completed update. The full/delta distinction only applies to the
+	-- blackboard portion of the payload.
 	local currentNs = frame.nodeStates
-	local changedNodes: { { idx: number, status: number } } = {}
-	for idx, status in currentNs do
-		if previousNodeStates[idx] ~= status then
-			table.insert(changedNodes, { idx = idx, status = status })
-		end
+	local nodeCount = 0
+	for _ in currentNs do
+		nodeCount += 1
 	end
-	writeU32(w, #changedNodes)
-	for _, change in changedNodes do
-		writeU32(w, change.idx)
-		writeU8(w, change.status)
+	writeU32(w, nodeCount)
+	for idx, status in currentNs do
+		writeU32(w, idx)
+		writeU8(w, status)
 	end
 
 	-- Diff by direct `~=`. Callers are expected to have run the blackboard
@@ -660,6 +660,13 @@ local function encodeSubscribe(treeId: number, subscribe: boolean): buffer
 	return finish(w)
 end
 
+local function encodePauseRequest(treeId: number, paused: boolean): buffer
+	local w = newWriter(8)
+	writeU32(w, treeId)
+	writeU8(w, if paused then 1 else 0)
+	return finish(w)
+end
+
 local function encodeTreeDefinitionRequest(treeId: number): buffer
 	local w = newWriter(4)
 	writeU32(w, treeId)
@@ -676,6 +683,16 @@ local function decodeSubscribe(buf: buffer): ({ treeId: number, subscribe: boole
 	local treeId = readU32(r)
 	local flag = readU8(r)
 	return { treeId = treeId, subscribe = flag == 1 }
+end
+
+local function decodePauseRequest(buf: buffer): ({ treeId: number, paused: boolean })?
+	if buffer.len(buf) < 5 then
+		return nil
+	end
+	local r = newReader(buf)
+	local treeId = readU32(r)
+	local flag = readU8(r)
+	return { treeId = treeId, paused = flag == 1 }
 end
 
 local function decodeTreeDefinitionRequest(buf: buffer): number?
@@ -721,6 +738,8 @@ return {
 	decodeSnapshot = decodeSnapshot,
 	encodeSubscribe = encodeSubscribe,
 	decodeSubscribe = decodeSubscribe,
+	encodePauseRequest = encodePauseRequest,
+	decodePauseRequest = decodePauseRequest,
 	encodeTreeDefinitionRequest = encodeTreeDefinitionRequest,
 	decodeTreeDefinitionRequest = decodeTreeDefinitionRequest,
 	buildTreeDefinitionResponse = buildTreeDefinitionResponse,

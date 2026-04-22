@@ -1,0 +1,26 @@
+std = "selene_definitions"
+exclude = [
+    "zune/*",
+    "*/**/network.lua",
+    "*/**/network.luau",
+    "*/**/networkTypes.lua",
+    "*/**/networkTypes.luau",
+    "*/**/WeaponsSystem/*",
+    "*/**/*.profiler.lua",
+    "roblox_packages/*",
+    "dist/*",
+    "luau_packages/*",
+    "lune_packages/*",
+]
+
+[config]
+# Allow for `_G.__DEV__` (etc) with packages like React-lua
+global_usage = { ignore_pattern = "^__" }
+
+[rules]
+global_usage = "allow"
+mixed_table = "allow"
+unused_variable = "allow"
+manual_table_clone = "allow"
+empty_if = "allow"
+shadowing = "allow"

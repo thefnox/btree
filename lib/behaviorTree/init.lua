@@ -77,9 +77,16 @@ function Wrapper.new(definition, blackboard, debug)
         -- subscribe to this tree. Server-only; returns 0 on the client.
         -- The definition is stored so clients can request its static structure
         -- over the DebugTreeDefinition RemoteEvent.
-        local treeId = debugNetwork.registerTree(debugName, definitionPath, definition)
+        local treeId = debugNetwork.registerTree(debugName, definitionPath, definition, function(paused)
+            if paused then
+                tree:pause()
+            else
+                tree:resume()
+            end
+        end)
 
         local nativeUpdate = tree.update
+        local lastRemoteNodeStates = {}
         tree.update = function(self)
             local nodeStates = {}
             local function onNodeUpdate(nodeIndex, status)
@@ -87,6 +94,13 @@ function Wrapper.new(definition, blackboard, debug)
             end
             local status, nativeSnapshot = nativeUpdate(self, onNodeUpdate)
             local isPaused = nativeSnapshot ~= nil and nativeSnapshot.paused == true
+            if next(nodeStates) ~= nil then
+                -- Preserve the terminal status of every node visited during the
+                -- last completed update. While paused there is no new trace, so
+                -- the remote debugger should continue seeing the prior update's
+                -- visited-node map instead of being overwritten by an empty one.
+                lastRemoteNodeStates = table.clone(nodeStates)
+            end
             if event and (next(nodeStates) or isPaused) then
                 event:Fire(definitionPath, debugName, {
                     tick = if nativeSnapshot then nativeSnapshot.tick else nil,
@@ -95,17 +109,15 @@ function Wrapper.new(definition, blackboard, debug)
                     blackboard = serializeBlackboard(blackboard),
                 })
             end
-            -- Forward the authoritative (full) snapshot to the network
-            -- debugger. `nativeSnapshot.nodeStates` holds the status of every
-            -- node — we use it rather than the ticked-only `nodeStates`
-            -- captured above so remote clients can diff against a stable
-            -- baseline.
+            -- Forward the visited-node execution trace to the remote debugger.
+            -- Unlike the native snapshot, this preserves the final status of
+            -- every node actually visited during the last completed update.
             if treeId ~= 0 and nativeSnapshot ~= nil then
                 debugNetwork.onTreeUpdated(
                     treeId,
                     nativeSnapshot.tick,
                     isPaused,
-                    nativeSnapshot.nodeStates,
+                    lastRemoteNodeStates,
                     blackboard
                 )
             end

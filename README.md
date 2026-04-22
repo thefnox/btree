@@ -216,7 +216,7 @@ type NodeMeta = {
 
 ### Remote debugging
 
-In addition to the in-process `BTDebugSnapshot` BindableEvent, the server exposes four buffer-based RemoteEvents so clients can observe any tree created with debugging enabled. The RemoteEvents are lazily parented under the library script the first time a debug-enabled tree is registered, so non-debug builds carry no remote-event overhead.
+In addition to the in-process `BTDebugSnapshot` BindableEvent, the server exposes five buffer-based RemoteEvents so clients can observe any tree created with debugging enabled. The RemoteEvents are lazily parented under the library script the first time a debug-enabled tree is registered, so non-debug builds carry no remote-event overhead.
 
 | RemoteEvent | Direction | Payload |
 |---|---|---|
@@ -225,7 +225,11 @@ In addition to the in-process `BTDebugSnapshot` BindableEvent, the server expose
 | `DebugSubscribe` | Client → Server | Buffer: `u32 treeId, u8 subscribe` (1 to start, 0 to stop). |
 | `DebugSnapshot` | Server → Client | Buffer: `u8 kind` (0=full, 1=delta), `u32 treeId`, `u32 tick`, `u8 paused`, node-state entries, then blackboard entries. |
 
-The first snapshot a subscriber receives is a full packet containing every node state and the complete serialized blackboard. Each subsequent packet is a delta containing only the node states that changed and the blackboard keys that were set or removed.
+The first snapshot a subscriber receives is a full packet containing the last completed update trace for the tree and the complete serialized blackboard. Each subsequent packet sends the full visited-node trace for that update again, while only the blackboard portion is delta-compressed (`blackboardSet` / `blackboardRemoved`).
+
+`nodeStates` contains the final status of every node that was visited during the last completed `tree:update()`. Nodes that were not visited in that update are omitted entirely.
+
+Remote pause control is available through a `DebugTreePause` RemoteEvent. Its payload is `u32 treeId, u8 paused`, where `1` pauses the tree and `0` resumes it. The server applies the new pause state immediately and rebroadcasts a snapshot with the updated `paused` flag.
 
 **Tree-definition packet format.** To avoid hardcoding a shared type enum on both server and client, every tree-definition packet starts with a self-describing type enum. The layout is:
 
@@ -283,9 +287,14 @@ remotes.treeDefinition:FireServer(debugNetwork.encodeTreeDefinitionRequest(treeI
 remotes.snapshot.OnClientEvent:Connect(function(buf)
     local packet = debugNetwork.decodeSnapshot(buf)
     -- packet.kind == "full" | "delta"
-    -- packet.nodeStates, packet.blackboardSet, packet.blackboardRemoved
+    -- packet.nodeStates is the full visited-node trace for that update
+    -- packet.blackboardSet / packet.blackboardRemoved are still deltas
 end)
 remotes.subscribe:FireServer(debugNetwork.encodeSubscribe(treeId, true))
+
+-- Pause or resume the tree remotely.
+remotes.pause:FireServer(debugNetwork.encodePauseRequest(treeId, true)) -- pause
+remotes.pause:FireServer(debugNetwork.encodePauseRequest(treeId, false)) -- resume
 ```
 
 ## License

@@ -4,7 +4,7 @@
 -- Networked debugging for behavior trees.
 --
 -- On the server, when a tree is registered (by the wrapper whenever a tree is
--- created with debug enabled), four RemoteEvents are lazily created under the
+-- created with debug enabled), five RemoteEvents are lazily created under the
 -- library module:
 --   DebugTreeList        — client fires an empty buffer to request the list
 --                          of active debug trees; server replies on the same
@@ -41,6 +41,7 @@ type Remotes = {
 	treeList: RemoteEvent,
 	treeDefinition: RemoteEvent,
 	subscribe: RemoteEvent,
+	pause: RemoteEvent,
 	snapshot: RemoteEvent,
 }
 
@@ -54,10 +55,9 @@ local parentInstance: Instance = script.Parent :: Instance
 
 type SubscriberState = {
 	-- Per-player per-tree state. Nil until the player has received their
-	-- first snapshot. After that, holds the last sent blackboard and node
-	-- states so the next packet can be a delta against them.
+	-- first snapshot. After that, holds the last sent blackboard so the next
+	-- packet can preserve trace semantics while still diffing blackboard state.
 	lastBlackboard: { [string]: any }?,
-	lastNodeStates: { [number]: number }?,
 }
 
 type TreeEntry = {
@@ -67,9 +67,10 @@ type TreeEntry = {
 	executionCount: number,
 	definition: any,
 	currentBlackboard: { [string]: any }?,
-	currentNodeStates: { [number]: number }?,
+	currentTraceNodeStates: { [number]: number }?,
 	currentTick: number,
 	currentPaused: boolean,
+	setPaused: (paused: boolean) -> (),
 	subscribers: { [Player]: SubscriberState },
 }
 
@@ -94,9 +95,27 @@ local function frameFromEntry(entry: TreeEntry): debugCodec.SnapshotFrame
 		treeId = entry.id,
 		tick = entry.currentTick,
 		paused = entry.currentPaused,
-		nodeStates = entry.currentNodeStates or {},
+		nodeStates = entry.currentTraceNodeStates or {},
 		blackboard = entry.currentBlackboard or {},
 	}
+end
+
+local function broadcastSnapshot(entry: TreeEntry)
+	if not remotes or entry.currentBlackboard == nil then
+		return
+	end
+	local snapshotEvent = remotes.snapshot
+	local frame = frameFromEntry(entry)
+	for player, state in entry.subscribers do
+		local buf: buffer
+		if state.lastBlackboard == nil then
+			buf = debugCodec.encodeFullSnapshot(frame)
+		else
+			buf = debugCodec.encodeDeltaSnapshot(frame, state.lastBlackboard :: any)
+		end
+		snapshotEvent:FireClient(player, buf)
+		state.lastBlackboard = table.clone(entry.currentBlackboard :: { [string]: any })
+	end
 end
 
 local DebugNetwork = {}
@@ -123,6 +142,10 @@ local function ensureRemotes()
 	subscribe.Name = "DebugSubscribe"
 	subscribe.Parent = parentInstance
 
+	local pause = parentInstance:FindFirstChild("DebugTreePause") :: RemoteEvent? or Instance.new("RemoteEvent")
+	pause.Name = "DebugTreePause"
+	pause.Parent = parentInstance
+
 	local snapshot = parentInstance:FindFirstChild("DebugSnapshot") :: RemoteEvent? or Instance.new("RemoteEvent")
 	snapshot.Name = "DebugSnapshot"
 	snapshot.Parent = parentInstance
@@ -131,6 +154,7 @@ local function ensureRemotes()
 		treeList = treeList,
 		treeDefinition = treeDefinition,
 		subscribe = subscribe,
+		pause = pause,
 		snapshot = snapshot,
 	}
 
@@ -169,19 +193,35 @@ local function ensureRemotes()
 		end
 		if request.subscribe then
 			if entry.subscribers[player] == nil then
-				entry.subscribers[player] = { lastBlackboard = nil, lastNodeStates = nil }
+				entry.subscribers[player] = { lastBlackboard = nil }
 				-- Send initial full snapshot immediately if we have data.
 				if entry.currentBlackboard ~= nil then
 					local state = entry.subscribers[player]
 					local buf = debugCodec.encodeFullSnapshot(frameFromEntry(entry))
 					snapshot:FireClient(player, buf)
 					state.lastBlackboard = table.clone(entry.currentBlackboard :: { [string]: any })
-					state.lastNodeStates = table.clone(entry.currentNodeStates :: { [number]: number })
 				end
 			end
 		else
 			entry.subscribers[player] = nil
 		end
+	end)
+
+	pause.OnServerEvent:Connect(function(_player, payload)
+		if typeof(payload) ~= "buffer" then
+			return
+		end
+		local request = debugCodec.decodePauseRequest(payload :: buffer)
+		if request == nil then
+			return
+		end
+		local entry = trees[request.treeId]
+		if not entry then
+			return
+		end
+		entry.setPaused(request.paused)
+		entry.currentPaused = request.paused
+		broadcastSnapshot(entry)
 	end)
 
 	-- Clean up subscriber state when a player leaves so we don't leak
@@ -195,7 +235,12 @@ end
 
 -- Registers a new debug tree. Returns the assigned id. Server-only; on the
 -- client this is a no-op returning 0.
-function DebugNetwork.registerTree(debugName: string, definitionPath: string, definition: any): number
+function DebugNetwork.registerTree(
+	debugName: string,
+	definitionPath: string,
+	definition: any,
+	setPaused: (paused: boolean) -> ()
+): number
 	if not IS_SERVER then
 		return 0
 	end
@@ -209,17 +254,18 @@ function DebugNetwork.registerTree(debugName: string, definitionPath: string, de
 		executionCount = 0,
 		definition = definition,
 		currentBlackboard = nil,
-		currentNodeStates = nil,
+		currentTraceNodeStates = nil,
 		currentTick = 0,
 		currentPaused = false,
+		setPaused = setPaused,
 		subscribers = {},
 	}
 	return id
 end
 
--- Called by the wrapper after each tree:update(). `nodeStates` is the
--- *authoritative* full node-state table (as returned by the native snapshot),
--- and `blackboard` is the raw table (will be serialized here).
+-- Called by the wrapper after each tree:update(). `nodeStates` is the final
+-- visited-node trace for the last completed update, and `blackboard` is the
+-- raw table (will be serialized here).
 function DebugNetwork.onTreeUpdated(
 	treeId: number,
 	tick: number,
@@ -237,30 +283,15 @@ function DebugNetwork.onTreeUpdated(
 	entry.executionCount += 1
 	entry.currentTick = tick
 	entry.currentPaused = paused
-	entry.currentNodeStates = table.clone(nodeStates)
+	entry.currentTraceNodeStates = table.clone(nodeStates)
 	entry.currentBlackboard = serializeBlackboard(blackboard)
-
-	if not remotes then
-		return
-	end
-	local snapshotEvent = remotes.snapshot
-	local frame = frameFromEntry(entry)
-	for player, state in entry.subscribers do
-		local buf: buffer
-		if state.lastBlackboard == nil then
-			buf = debugCodec.encodeFullSnapshot(frame)
-		else
-			buf = debugCodec.encodeDeltaSnapshot(frame, state.lastNodeStates :: any, state.lastBlackboard :: any)
-		end
-		snapshotEvent:FireClient(player, buf)
-		state.lastBlackboard = table.clone(entry.currentBlackboard :: { [string]: any })
-		state.lastNodeStates = table.clone(entry.currentNodeStates :: { [number]: number })
-	end
+	broadcastSnapshot(entry)
 end
 
 -- Client helpers are re-exported from debugCodec so consumers don't need to
 -- reach into the codec module directly.
 DebugNetwork.encodeSubscribe = debugCodec.encodeSubscribe
+DebugNetwork.encodePauseRequest = debugCodec.encodePauseRequest
 DebugNetwork.encodeTreeDefinitionRequest = debugCodec.encodeTreeDefinitionRequest
 DebugNetwork.decodeTreeList = debugCodec.decodeTreeList
 DebugNetwork.decodeTreeDefinition = debugCodec.decodeTreeDefinition
@@ -271,7 +302,7 @@ export type DefinitionNode = debugCodec.DefinitionNode
 export type TreeDefinitionPacket = debugCodec.TreeDefinitionPacket
 export type SnapshotPacket = debugCodec.SnapshotPacket
 
--- Client helper: returns the four RemoteEvents once the server has created
+-- Client helper: returns the five RemoteEvents once the server has created
 -- them. Yields until all exist. Returns nil if any does not appear within
 -- `timeout` seconds (when specified).
 function DebugNetwork.waitForRemotes(timeout: number?): Remotes?
@@ -284,12 +315,14 @@ function DebugNetwork.waitForRemotes(timeout: number?): Remotes?
 	local treeList = waitFor("DebugTreeList")
 	local treeDefinition = waitFor("DebugTreeDefinition")
 	local subscribe = waitFor("DebugSubscribe")
+	local pause = waitFor("DebugTreePause")
 	local snapshot = waitFor("DebugSnapshot")
-	if treeList and treeDefinition and subscribe and snapshot then
+	if treeList and treeDefinition and subscribe and pause and snapshot then
 		return {
 			treeList = treeList,
 			treeDefinition = treeDefinition,
 			subscribe = subscribe,
+			pause = pause,
 			snapshot = snapshot,
 		}
 	end
