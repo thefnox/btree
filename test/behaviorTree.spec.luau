@@ -118,7 +118,7 @@ return function(tiniest: tiniest_actual)
 		end)
 
 		test("passes params to run", function()
-			local params = { speed = 16 }
+			local params = { speed = 16, nested = { mode = "walk" } }
 			local received: any = nil
 			BT.new(
 				BT.task({
@@ -129,7 +129,9 @@ return function(tiniest: tiniest_actual)
 				}, params),
 				{}
 			):update()
-			expect(received).is(params)
+			expect(received.speed).is(16)
+			expect(received.nested).is(params.nested)
+			expect(received == params).is(false)
 		end)
 
 		test("defaults nil params to an empty table", function()
@@ -143,7 +145,9 @@ return function(tiniest: tiniest_actual)
 			BT.new(def, {}):update()
 			expect(type(def.params)).is("table")
 			expect(next(def.params)).is(nil)
-			expect(received).is(def.params)
+			expect(type(received)).is("table")
+			expect(next(received)).is(nil)
+			expect(received == def.params).is(false)
 		end)
 
 		test("passes blackboard to onStart and onEnd", function()
@@ -793,18 +797,35 @@ return function(tiniest: tiniest_actual)
 			expect(snap2.tick).is(2)
 		end)
 
-		test("snapshot contains only tick, paused, and nodeStates (no structural info)", function()
+		test("snapshot contains runtime-only fields, including task params, but no structural info", function()
 			local bb = {}
 			local tree = BT.new(BT.task(SUCCEED), bb, true)
 			local _, snap = tree:update()
 			expect(snap.tick).exists()
 			expect(snap.paused).exists()
 			expect(snap.nodeStates).exists()
+			expect(snap.taskParams).exists()
 			-- Must NOT contain structural fields
 			expect(snap.nodes).never_exists()
 			expect(snap.definition).never_exists()
 			expect(snap.paramTypes).never_exists()
 			expect(snap.lastStatus).never_exists()
+		end)
+
+		test("snapshot includes resolved task params for the tasks visited in the last update", function()
+			local bb = { speed = 8 }
+			local taskDef = BT.task({
+				params = { speed = "number", missing = "string" },
+				run = function()
+					return SUCCESS
+				end,
+			}, {
+				speed = BT.bind("speed"),
+			})
+			local tree = BT.new(taskDef, bb, true)
+			local _, snap = tree:update()
+			expect(snap.taskParams[1].speed).is(8)
+			expect(snap.taskParams[1].missing).is("nil")
 		end)
 
 		test("debugCallback is called before and after each node tick", function()
@@ -1517,14 +1538,94 @@ return function(tiniest: tiniest_actual)
 			expect(log[2]).is("B_enter")
 		end)
 
-		test("onEnter and onExit receive the blackboard and params", function()
+		test("BT.bind resolves simple, nested, numeric, and missing paths nil-safely", function()
+			local received: any = nil
+			local bb = {
+				target = "orc",
+				squad = {
+					members = {
+						{
+							order = {
+								params = "hold",
+							},
+						},
+					},
+				},
+				blocker = 8,
+			}
+			BT.new(
+				BT.task({
+					run = function(_, p)
+						received = p
+						return SUCCESS
+					end,
+				}, {
+					direct = BT.bind("target"),
+					nested = BT.bind("squad.members.1.order.params"),
+					missing = BT.bind("squad.members.2.order.params"),
+					blocked = BT.bind("blocker.order"),
+				}),
+				bb
+			):update()
+			expect(received.direct).is("orc")
+			expect(received.nested).is("hold")
+			expect(received.missing).is(nil)
+			expect(received.blocked).is(nil)
+		end)
+
+		test("BT.bind rejects empty and malformed paths", function()
+			expect(function()
+				BT.bind("")
+			end).fails()
+			expect(function()
+				BT.bind("squad..order")
+			end).fails()
+		end)
+
+		test("BT.calc resolves once per activation and stays stable across RUNNING ticks", function()
+			local bb = { speed = 8 }
+			local calcCount = 0
+			local firstParams: any = nil
+			local secondParams: any = nil
+			local ticks = 0
+			local tree = BT.new(
+				BT.task({
+					run = function(_, p)
+						ticks += 1
+						if ticks == 1 then
+							firstParams = p
+							bb.speed = 32
+							return RUNNING
+						end
+						secondParams = p
+						return SUCCESS
+					end,
+				}, {
+					speed = BT.calc(function(currentBb)
+						calcCount += 1
+						return currentBb.speed
+					end),
+				}),
+				bb
+			)
+			tree:update()
+			tree:update()
+			expect(calcCount).is(1)
+			expect(firstParams == secondParams).is(true)
+			expect(firstParams.speed).is(8)
+			expect(secondParams.speed).is(8)
+		end)
+
+		test("task hooks receive the same resolved params table for the full activation", function()
 			local enterBb: any = nil
 			local enterParams: any = nil
+			local startParams: any = nil
+			local runParams: any = nil
+			local endParams: any = nil
 			local leaveBb: any = nil
 			local leaveParams: any = nil
 			local flag = true
-			local bb = { marker = true }
-			local params = { speed = 8 }
+			local bb = { marker = true, speed = 8 }
 			local def = BT.sequence({
 				BT.condition(function()
 					return flag
@@ -1534,23 +1635,88 @@ return function(tiniest: tiniest_actual)
 						enterBb = b
 						enterParams = p
 					end,
+					onStart = function(_, p)
+						startParams = p
+					end,
 					onExit = function(b, p)
 						leaveBb = b
 						leaveParams = p
 					end,
-					run = function()
+					run = function(_, p)
+						runParams = p
 						return SUCCESS
 					end,
-				}, params),
+					onEnd = function(_, p)
+						endParams = p
+					end,
+				}, {
+					speed = BT.bind("speed"),
+					label = BT.calc(function(currentBb)
+						return `speed:{currentBb.speed}`
+					end),
+				}),
 			})
 			local tree = BT.new(def, bb)
 			tree:update()
+			bb.speed = 20
 			flag = false
 			tree:update()
 			expect(enterBb).is(bb)
-			expect(enterParams).is(params)
 			expect(leaveBb).is(bb)
-			expect(leaveParams).is(params)
+			expect(enterParams == startParams).is(true)
+			expect(startParams == runParams).is(true)
+			expect(runParams == endParams).is(true)
+			expect(endParams == leaveParams).is(true)
+			expect(leaveParams.speed).is(8)
+			expect(leaveParams.label).is("speed:8")
+		end)
+
+		test("reset clears cached params so the next activation re-resolves", function()
+			local bb = { speed = 8 }
+			local captures: { any } = {}
+			local tree = BT.new(
+				BT.task({
+					run = function(_, p)
+						table.insert(captures, p)
+						return SUCCESS
+					end,
+				}, {
+					speed = BT.bind("speed"),
+				}),
+				bb
+			)
+			tree:update()
+			bb.speed = 20
+			tree:reset()
+			tree:update()
+			expect(#captures).is(2)
+			expect(captures[1] == captures[2]).is(false)
+			expect(captures[1].speed).is(8)
+			expect(captures[2].speed).is(20)
+		end)
+
+		test("stop clears cached params so the next activation re-resolves", function()
+			local bb = { speed = 8 }
+			local captures: { any } = {}
+			local tree = BT.new(
+				BT.task({
+					run = function(_, p)
+						table.insert(captures, p)
+						return RUNNING
+					end,
+				}, {
+					speed = BT.bind("speed"),
+				}),
+				bb
+			)
+			tree:update()
+			bb.speed = 20
+			tree:stop()
+			tree:update()
+			expect(#captures).is(2)
+			expect(captures[1] == captures[2]).is(false)
+			expect(captures[1].speed).is(8)
+			expect(captures[2].speed).is(20)
 		end)
 
 		test("onExit fires when tree finishes and a previously ticked task is not reached", function()
@@ -1712,138 +1878,54 @@ return function(tiniest: tiniest_actual)
 	end)
 
 	------------------------------------------------------------------------
-	-- task param types
+	-- task param bindings
 	------------------------------------------------------------------------
 
-	describe("task param types", function()
-		test("no error when module has no params schema", function()
-			local m: BT.BTreeTask = {
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { speed = 16 })
-			end).never_fails()
-		end)
-
-		test("no error when schema is satisfied with correct types", function()
-			local m: BT.BTreeTask = {
-				params = { speed = "number", name = "string", active = "boolean" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { speed = 10, name = "run", active = true })
-			end).never_fails()
-		end)
-
-		test("errors when a number param is the wrong type", function()
-			local m: BT.BTreeTask = {
-				params = { speed = "number" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { speed = "fast" })
-			end).fails()
-		end)
-
-		test("errors when a string param is the wrong type", function()
-			local m: BT.BTreeTask = {
-				params = { label = "string" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { label = 42 })
-			end).fails()
-		end)
-
-		test("errors when a boolean param is the wrong type", function()
-			local m: BT.BTreeTask = {
-				params = { active = "boolean" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { active = 1 })
-			end).fails()
-		end)
-
-		test("nil is accepted when params table is absent (all params implicitly nullable)", function()
-			local m: BT.BTreeTask = {
-				params = { speed = "number" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, nil)
-			end).never_fails()
-		end)
-
-		test("nil is accepted when a key is missing from the params table", function()
-			local m: BT.BTreeTask = {
-				params = { speed = "number" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, {})
-			end).never_fails()
-		end)
-
-		test("a wrong non-nil value still errors", function()
-			local m: BT.BTreeTask = {
-				params = { speed = "number" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { speed = "fast" })
-			end).fails()
-		end)
-
-		test("extra params not declared in schema are accepted silently", function()
-			local m: BT.BTreeTask = {
-				params = { speed = "number" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { speed = 10, undeclared = true })
-			end).never_fails()
-		end)
-
-		test("error message names the offending param", function()
-			local m: BT.BTreeTask = {
-				params = { speed = "number" },
-				run = function()
-					return SUCCESS
-				end,
-			}
-			expect(function()
-				BT.task(m, { speed = "fast" })
-			end).fails_with("speed")
-		end)
-
-		test("paramTypes is available on the task module", function()
+	describe("task param bindings", function()
+		test("legacy module params schemas are accepted as a no-op", function()
 			local schema: BT.ParamTypes = { speed = "number" }
 			local m: BT.BTreeTask = {
 				params = schema,
-				run = function()
+				run = function(_, p)
+					expect(p.speed).is("fast")
 					return SUCCESS
 				end,
 			}
+			expect(function()
+				BT.new(BT.task(m, { speed = "fast" }), {}):update()
+			end).never_fails()
 			expect(m.params).is(schema)
+		end)
+
+		test("bare top-level function params must be wrapped in BT.calc", function()
+			expect(function()
+				BT.task(SUCCEED, {
+					speed = function()
+						return 8
+					end,
+				})
+			end).fails_with("BT.calc")
+		end)
+
+		test("nested tables stay literal and are not recursively resolved", function()
+			local received: any = nil
+			local nested = {
+				speed = BT.bind("speed"),
+			}
+			local bb = { speed = 8 }
+			BT.new(
+				BT.task({
+					run = function(_, p)
+						received = p
+						return SUCCESS
+					end,
+				}, {
+					nested = nested,
+				}),
+				bb
+			):update()
+			expect(received.nested).is(nested)
+			expect(type(received.nested.speed)).is("table")
 		end)
 
 		test("paramTypes is nil on task module when no schema", function()

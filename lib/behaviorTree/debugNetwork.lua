@@ -68,6 +68,7 @@ type TreeEntry = {
 	definition: any,
 	currentBlackboard: { [string]: any }?,
 	currentTraceNodeStates: { [number]: number }?,
+	currentTraceTaskParams: { [number]: { [string]: any } }?,
 	currentTick: number,
 	currentPaused: boolean,
 	setPaused: (paused: boolean) -> (),
@@ -76,6 +77,17 @@ type TreeEntry = {
 
 local nextTreeId = 0
 local trees: { [number]: TreeEntry } = {}
+
+local function cloneTaskParamTrace(taskParams: { [number]: { [string]: any } }?): { [number]: { [string]: any } }
+	local out: { [number]: { [string]: any } } = {}
+	if taskParams == nil then
+		return out
+	end
+	for nodeIndex, params in taskParams do
+		out[nodeIndex] = table.clone(params)
+	end
+	return out
+end
 
 local function collectTreeList(): { debugCodec.TreeListEntry }
 	local out: { debugCodec.TreeListEntry } = {}
@@ -96,6 +108,7 @@ local function frameFromEntry(entry: TreeEntry): debugCodec.SnapshotFrame
 		tick = entry.currentTick,
 		paused = entry.currentPaused,
 		nodeStates = entry.currentTraceNodeStates or {},
+		taskParams = entry.currentTraceTaskParams or {},
 		blackboard = entry.currentBlackboard or {},
 	}
 end
@@ -255,6 +268,7 @@ function DebugNetwork.registerTree(
 		definition = definition,
 		currentBlackboard = nil,
 		currentTraceNodeStates = nil,
+		currentTraceTaskParams = nil,
 		currentTick = 0,
 		currentPaused = false,
 		setPaused = setPaused,
@@ -264,13 +278,15 @@ function DebugNetwork.registerTree(
 end
 
 -- Called by the wrapper after each tree:update(). `nodeStates` is the final
--- visited-node trace for the last completed update, and `blackboard` is the
--- raw table (will be serialized here).
+-- visited-node trace for the last completed update, `taskParams` carries the
+-- resolved params for the task nodes visited in that same update, and
+-- `blackboard` is the raw table (will be serialized here).
 function DebugNetwork.onTreeUpdated(
 	treeId: number,
 	tick: number,
 	paused: boolean,
 	nodeStates: { [number]: number },
+	taskParams: { [number]: { [string]: any } },
 	blackboard: any
 )
 	if not IS_SERVER then
@@ -284,6 +300,7 @@ function DebugNetwork.onTreeUpdated(
 	entry.currentTick = tick
 	entry.currentPaused = paused
 	entry.currentTraceNodeStates = table.clone(nodeStates)
+	entry.currentTraceTaskParams = cloneTaskParamTrace(taskParams)
 	entry.currentBlackboard = serializeBlackboard(blackboard)
 	broadcastSnapshot(entry)
 end

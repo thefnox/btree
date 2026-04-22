@@ -45,6 +45,10 @@ local readString = bufferUtil.readString
 local PACKET_FULL: number = 0
 local PACKET_DELTA: number = 1
 
+-- Per-task param value kinds used in snapshot packets.
+local TASK_PARAM_NUMBER: number = 0
+local TASK_PARAM_STRING: number = 1
+
 -- Per-key op codes used in delta packets.
 local BB_OP_REMOVE: number = 0
 local BB_OP_SET: number = 1
@@ -158,6 +162,62 @@ local function readValue(r: Reader): any
 		return readString(r)
 	end
 	error(`Unknown value tag {tag}`)
+end
+
+local function writeTaskParamValue(w: Writer, value: any)
+	if type(value) == "number" then
+		writeU8(w, TASK_PARAM_NUMBER)
+		writeF64(w, value)
+	else
+		writeU8(w, TASK_PARAM_STRING)
+		writeString(w, tostring(value))
+	end
+end
+
+local function readTaskParamValue(r: Reader): any
+	local tag = readU8(r)
+	if tag == TASK_PARAM_NUMBER then
+		return readF64(r)
+	elseif tag == TASK_PARAM_STRING then
+		return readString(r)
+	end
+	error(`Unknown task param value tag {tag}`)
+end
+
+local function writeTaskParamTrace(w: Writer, taskParams: { [number]: { [string]: any } })
+	local taskCount = 0
+	for _ in taskParams do
+		taskCount += 1
+	end
+	writeU32(w, taskCount)
+	for nodeIdx, params in taskParams do
+		writeU32(w, nodeIdx)
+		local paramCount = 0
+		for _ in params do
+			paramCount += 1
+		end
+		writeU32(w, paramCount)
+		for key, value in params do
+			writeString(w, tostring(key))
+			writeTaskParamValue(w, value)
+		end
+	end
+end
+
+local function readTaskParamTrace(r: Reader): { [number]: { [string]: any } }
+	local taskCount = readU32(r)
+	local taskParams: { [number]: { [string]: any } } = {}
+	for _ = 1, taskCount do
+		local nodeIdx = readU32(r)
+		local paramCount = readU32(r)
+		local params: { [string]: any } = {}
+		for _ = 1, paramCount do
+			local key = readString(r)
+			params[key] = readTaskParamValue(r)
+		end
+		taskParams[nodeIdx] = params
+	end
+	return taskParams
 end
 
 ------------------------------------------------------------------------
@@ -290,15 +350,19 @@ local function encodeTreeDefinition(definition: any): buffer
 			else
 				writeU8(w, 0)
 			end
-			local params = def.params or {}
-			local paramCount = 0
-			for _ in params do
-				paramCount += 1
+			local paramTypes = if mod and mod.params ~= nil then mod.params else nil
+			local paramTypeCount = 0
+			if paramTypes ~= nil then
+				for _ in paramTypes do
+					paramTypeCount += 1
+				end
 			end
-			writeU32(w, paramCount)
-			for k, v in params do
-				writeString(w, tostring(k))
-				writeValue(w, v)
+			writeU32(w, paramTypeCount)
+			if paramTypes ~= nil then
+				for key, typeName in paramTypes do
+					writeString(w, tostring(key))
+					writeString(w, tostring(typeName))
+				end
 			end
 		elseif t == "parallel" then
 			writeString(w, tostring(def.successPolicy))
@@ -331,7 +395,7 @@ export type DefinitionNode = {
 	size: Vector2?,
 	position: Vector2?,
 	taskName: string?,
-	taskParams: { [string]: any }?,
+	taskParamTypes: { [string]: string }?,
 	successPolicy: ("requireAll" | "requireOne")?,
 	failurePolicy: ("requireAll" | "requireOne")?,
 	times: number?,
@@ -399,13 +463,15 @@ local function decodeTreeDefinitionFromReader(r: Reader, treeId: number, totalLe
 			if readU8(r) == 1 then
 				node.taskName = readString(r)
 			end
-			local paramCount = readU32(r)
-			local params: { [string]: any } = {}
-			for _ = 1, paramCount do
-				local key = readString(r)
-				params[key] = readValue(r)
+			local paramTypeCount = readU32(r)
+			if paramTypeCount > 0 then
+				local paramTypes: { [string]: string } = {}
+				for _ = 1, paramTypeCount do
+					local key = readString(r)
+					paramTypes[key] = readString(r)
+				end
+				node.taskParamTypes = paramTypes
 			end
-			node.taskParams = params
 		elseif typeName == "parallel" then
 			node.successPolicy = readString(r) :: any
 			node.failurePolicy = readString(r) :: any
@@ -485,6 +551,7 @@ export type SnapshotFrame = {
 	tick: number,
 	paused: boolean,
 	nodeStates: { [number]: number },
+	taskParams: { [number]: { [string]: any } },
 	blackboard: { [string]: any },
 }
 
@@ -505,6 +572,8 @@ local function encodeFullSnapshot(frame: SnapshotFrame): buffer
 		writeU32(w, nodeIdx)
 		writeU8(w, status)
 	end
+
+	writeTaskParamTrace(w, frame.taskParams)
 
 	local bb = frame.blackboard
 	local keyCount = 0
@@ -543,6 +612,8 @@ local function encodeDeltaSnapshot(
 		writeU32(w, idx)
 		writeU8(w, status)
 	end
+
+	writeTaskParamTrace(w, frame.taskParams)
 
 	-- Diff by direct `~=`. Callers are expected to have run the blackboard
 	-- through `serializeBlackboard` first, which leaves only primitives,
@@ -583,6 +654,7 @@ export type SnapshotPacket = {
 	tick: number,
 	paused: boolean,
 	nodeStates: { [number]: number },
+	taskParams: { [number]: { [string]: any } },
 	blackboardSet: { [string]: any },
 	blackboardRemoved: { string },
 }
@@ -605,6 +677,7 @@ local function decodeSnapshot(buf: buffer): SnapshotPacket
 			local status = readU8(r)
 			nodeStates[idx] = status
 		end
+		local taskParams = readTaskParamTrace(r)
 		local keyCount = readU32(r)
 		for _ = 1, keyCount do
 			local key = readString(r)
@@ -616,6 +689,7 @@ local function decodeSnapshot(buf: buffer): SnapshotPacket
 			tick = tick,
 			paused = paused,
 			nodeStates = nodeStates,
+			taskParams = taskParams,
 			blackboardSet = bbSet,
 			blackboardRemoved = bbRemoved,
 		}
@@ -626,6 +700,7 @@ local function decodeSnapshot(buf: buffer): SnapshotPacket
 			local status = readU8(r)
 			nodeStates[idx] = status
 		end
+		local taskParams = readTaskParamTrace(r)
 		local bbOpCount = readU32(r)
 		for _ = 1, bbOpCount do
 			local op = readU8(r)
@@ -642,6 +717,7 @@ local function decodeSnapshot(buf: buffer): SnapshotPacket
 			tick = tick,
 			paused = paused,
 			nodeStates = nodeStates,
+			taskParams = taskParams,
 			blackboardSet = bbSet,
 			blackboardRemoved = bbRemoved,
 		}

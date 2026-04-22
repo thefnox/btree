@@ -108,11 +108,15 @@ return function(tiniest)
 			expect(decoded.nodes[1].times).is(-1)
 		end)
 
-		test("task with params encodes name and values", function()
+		test("task encodes name and param types without task values", function()
 			local def = {
 				_type = "task",
 				module = {
 					name = "PatrolMove",
+					params = {
+						speed = "number",
+						mode = "string",
+					},
 					run = function()
 						return 0
 					end,
@@ -124,10 +128,10 @@ return function(tiniest)
 			expect(decoded.treeId).is(7)
 			expect(decoded.nodes[1].type).is("task")
 			expect(decoded.nodes[1].taskName).is("PatrolMove")
-			expect(decoded.nodes[1].taskParams ~= nil).is(true)
-			local params = decoded.nodes[1].taskParams :: { [string]: any }
-			expect(params.speed).is(14)
-			expect(params.message).is("hello")
+			local taskNode = decoded.nodes[1] :: any
+			expect(taskNode.taskParams).never_exists()
+			expect(taskNode.taskParamTypes.speed).is("number")
+			expect(taskNode.taskParamTypes.mode).is("string")
 		end)
 
 		test("random selector encodes weights when present", function()
@@ -266,6 +270,13 @@ return function(tiniest)
 				tick = 12,
 				paused = false,
 				nodeStates = { [1] = 0, [2] = 1, [3] = 2 },
+				taskParams = {
+					[3] = {
+						speed = 14.5,
+						label = "sentry",
+						disabled = false,
+					},
+				},
 				blackboard = {
 					alerted = true,
 					speed = 14.5,
@@ -282,6 +293,9 @@ return function(tiniest)
 			expect(decoded.nodeStates[1]).is(0)
 			expect(decoded.nodeStates[2]).is(1)
 			expect(decoded.nodeStates[3]).is(2)
+			expect(decoded.taskParams[3].speed).is(14.5)
+			expect(decoded.taskParams[3].label).is("sentry")
+			expect(decoded.taskParams[3].disabled).is("false")
 			expect(decoded.blackboardSet.alerted).is(true)
 			expect(decoded.blackboardSet.speed).is(14.5)
 			expect(decoded.blackboardSet.name).is("sentry")
@@ -295,6 +309,7 @@ return function(tiniest)
 				tick = 0,
 				paused = true,
 				nodeStates = {},
+				taskParams = {},
 				blackboard = {},
 			}
 			local decoded = codec.decodeSnapshot(codec.encodeFullSnapshot(frame))
@@ -307,6 +322,12 @@ return function(tiniest)
 				tick = 2,
 				paused = false,
 				nodeStates = { [1] = 2, [2] = 0, [3] = 1 },
+				taskParams = {
+					[2] = {
+						speed = 16,
+						target = "nil",
+					},
+				},
 				blackboard = {},
 			}
 			local buf = codec.encodeDeltaSnapshot(frame, {})
@@ -322,6 +343,8 @@ return function(tiniest)
 			expect(decoded.nodeStates[1]).is(2)
 			expect(decoded.nodeStates[2]).is(0)
 			expect(decoded.nodeStates[3]).is(1)
+			expect(decoded.taskParams[2].speed).is(16)
+			expect(decoded.taskParams[2].target).is("nil")
 		end)
 
 		test("delta emits blackboard set and remove operations", function()
@@ -330,6 +353,7 @@ return function(tiniest)
 				tick = 2,
 				paused = false,
 				nodeStates = {},
+				taskParams = {},
 				blackboard = {
 					alerted = true, -- changed (was false)
 					target = "A", -- unchanged
@@ -362,6 +386,7 @@ return function(tiniest)
 				tick = 0,
 				paused = false,
 				nodeStates = {},
+				taskParams = {},
 				blackboard = { big = big },
 			}
 			local decoded = codec.decodeSnapshot(codec.encodeFullSnapshot(frame))

@@ -5,9 +5,10 @@
 -- When a tree is created with debug enabled, each tree:update() call passes a
 -- debugCallback to the native update function. The native library calls this
 -- callback before and after each node is ticked with (nodeIndex, status).
--- The wrapper accumulates these per-node updates into a single snapshot
--- (keyed by node index) and fires the BTDebugSnapshot BindableEvent once per
--- frame if the snapshot contains at least 2 entries.
+-- The wrapper accumulates these per-node updates into the last completed
+-- visited-node trace for that frame and fires the BTDebugSnapshot
+-- BindableEvent. The payload also includes resolved task params for the task
+-- nodes that executed in that last completed update.
 --
 -- The `debug` parameter to BT.new can be:
 --   false / nil  — no debugging
@@ -30,6 +31,9 @@ export type Status = nativeBT.Status
 export type Blackboard = nativeBT.Blackboard
 export type NodeMeta = nativeBT.NodeMeta
 export type ParamTypes = nativeBT.ParamTypes
+export type ParamPathSegment = nativeBT.ParamPathSegment
+export type ParamBinding = nativeBT.ParamBinding
+export type ParamCalculation = nativeBT.ParamCalculation
 export type Task = nativeBT.BTreeTask
 export type TaskDef = nativeBT.TaskDef
 export type ConditionDef = nativeBT.ConditionDef
@@ -52,6 +56,17 @@ export type Library = nativeBT.Library
 local event = script:FindFirstChild("BTDebugSnapshot")
 
 local Wrapper = {}
+
+local function cloneTaskParamTrace(taskParams: { [number]: { [string]: any } }?): { [number]: { [string]: any } }
+    local out: { [number]: { [string]: any } } = {}
+    if taskParams == nil then
+        return out
+    end
+    for nodeIndex, params in taskParams do
+        out[nodeIndex] = table.clone(params)
+    end
+    return out
+end
 
 -- Forward all constants and builder functions from the native library
 for key, value in nativeBT do
@@ -87,6 +102,7 @@ function Wrapper.new(definition, blackboard, debug)
 
         local nativeUpdate = tree.update
         local lastRemoteNodeStates = {}
+        local lastRemoteTaskParams = {}
         tree.update = function(self)
             local nodeStates = {}
             local function onNodeUpdate(nodeIndex, status)
@@ -94,18 +110,27 @@ function Wrapper.new(definition, blackboard, debug)
             end
             local status, nativeSnapshot = nativeUpdate(self, onNodeUpdate)
             local isPaused = nativeSnapshot ~= nil and nativeSnapshot.paused == true
-            if next(nodeStates) ~= nil then
+            if nativeSnapshot ~= nil and not isPaused then
                 -- Preserve the terminal status of every node visited during the
                 -- last completed update. While paused there is no new trace, so
                 -- the remote debugger should continue seeing the prior update's
                 -- visited-node map instead of being overwritten by an empty one.
                 lastRemoteNodeStates = table.clone(nodeStates)
             end
+            if nativeSnapshot ~= nil then
+                lastRemoteTaskParams = cloneTaskParamTrace(nativeSnapshot.taskParams)
+            end
+            local emittedNodeStates = if isPaused then lastRemoteNodeStates else nodeStates
+            local emittedTaskParams = lastRemoteTaskParams
+            if not isPaused then
+                emittedTaskParams = if nativeSnapshot then nativeSnapshot.taskParams else {}
+            end
             if event and (next(nodeStates) or isPaused) then
                 event:Fire(definitionPath, debugName, {
                     tick = if nativeSnapshot then nativeSnapshot.tick else nil,
                     paused = isPaused,
-                    nodeStates = nodeStates,
+                    nodeStates = emittedNodeStates,
+                    taskParams = emittedTaskParams,
                     blackboard = serializeBlackboard(blackboard),
                 })
             end
@@ -118,6 +143,7 @@ function Wrapper.new(definition, blackboard, debug)
                     nativeSnapshot.tick,
                     isPaused,
                     lastRemoteNodeStates,
+                    lastRemoteTaskParams,
                     blackboard
                 )
             end

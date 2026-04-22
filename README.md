@@ -7,7 +7,7 @@ A behavior tree library for Roblox, written in Luau.
 - Fully tested
 - Flat array-based runtime — no nested table allocations during ticks
 - Full Luau strict-mode types
-- Built-in parameter validation for task modules
+- Binding-based task params via `BT.bind(...)` and `BT.calc(...)`
 - Subtree inlining — subtrees are merged into the parent flat array at build time
 - Pause/resume support
 - Debug snapshots with per-node status, compatible with the BTree Studio plugin
@@ -45,7 +45,10 @@ return BT.selector({
         BT.condition(function(bb) return bb.alerted end),
         BT.task(ChaseTarget),
     }),
-    BT.task(MoveToPoint, { speed = 8 }),
+    BT.task(MoveToPoint, {
+        speed = 8,
+        targetPosition = BT.bind("targetPosition"),
+    }),
 })
 ```
 
@@ -84,10 +87,12 @@ local BT = require(game.ReplicatedStorage.BehaviorTree)
 return {
     params = {
         speed = "number",
+        targetPosition = "Vector3",
     },
 
     onStart = function(bb, params)
-        bb.agent:MoveTo(bb.targetPosition)
+        bb.agent.WalkSpeed = params.speed
+        bb.agent:MoveTo(params.targetPosition)
     end,
 
     run = function(bb, params): BT.Status?
@@ -153,6 +158,13 @@ return BT.sequence({
 | `BT.condition(check, meta?)` | Calls `check(blackboard)` — returns `SUCCESS` if true, `FAILURE` if false. |
 | `BT.subtree(module, meta?)` | Inlines another definition tree. |
 
+### Param helpers
+
+| Function | Behaviour |
+|---|---|
+| `BT.bind(path)` | Resolves a dot-separated blackboard path once when the task activation begins. Numeric segments index arrays/tables by number. |
+| `BT.calc(resolver)` | Calls `resolver(blackboard)` once when the task activation begins and stores the returned value in the resolved params table. |
+
 ### Tree API
 
 ```lua
@@ -183,23 +195,38 @@ type DebugSnapshot = {
     tick: number,               -- monotonically increasing tick counter
     paused: boolean,
     nodeStates: { [number]: Status }, -- keyed by 1-based DFS index
+    taskParams: { [number]: { [string]: any } }, -- resolved params for task nodes visited in the last completed update
 }
 ```
 
 Debug mode adds no overhead when disabled (`false` / `nil`).
 
-## Parameter validation
+## Task params
 
-When a task module declares a `params` schema, `BT.task()` validates the values passed at definition time. Supported type strings:
+Task params are resolved into a fresh table when a task activation begins, before any of that task's hooks run. The same resolved table is then reused for `onEnter`, `onStart`, `run`, `onEnd`, and the eventual `onExit`.
 
-Omitted or `nil` task params are normalized to an empty table before being stored on the task definition and passed to task hooks.
+Top-level param entries may be:
 
-- Lua primitives: `"number"`, `"string"`, `"boolean"`
-- Roblox types: `"Vector2"`, `"Vector3"`, any Roblox Instance class name
+- literals, which are copied into the resolved params table unchanged
+- `BT.bind("path.to.value")`, which nil-safely traverses the blackboard using dot-separated path segments
+- `BT.calc(function(bb) ... end)`, which computes a value from the current blackboard
+
+Nested tables are treated as literals and are not recursively resolved. Bare top-level function values are not allowed; wrap computed values with `BT.calc(...)` instead.
 
 ```lua
-BT.task(MyTask, { speed = 14, target = workspace.Boss })
+BT.task(MoveToPoint, {
+    speed = 14,
+    targetPosition = BT.bind("targetPosition"),
+    currentOrderParams = BT.bind("squad.members.1.order.params"),
+    timeout = BT.calc(function(bb)
+        return if bb.alerted then 1 else 3
+    end),
+})
 ```
+
+Legacy task-module `params` schemas are still accepted for compatibility, but they are no longer validated at runtime.
+
+If a task module declares `params = { key = "type" }`, that schema is still sent through the tree-definition debug payload so remote tooling can know the expected param keys and types. When that task executes, the snapshot payload for that update also carries the resolved param values keyed by the task node's DFS index.
 
 ## NodeMeta
 
@@ -223,13 +250,18 @@ In addition to the in-process `BTDebugSnapshot` BindableEvent, the server expose
 | `DebugTreeList` | Client ↔ Server | Client fires an empty buffer; server replies with `u16 count` followed by `{u32 id, u32 executionCount, len-prefixed debugName, len-prefixed definitionPath}` per tree. |
 | `DebugTreeDefinition` | Client ↔ Server | Client fires `u32 treeId`; server replies with `u32 treeId` (0 if unknown, and no further payload) followed by the encoded tree-definition packet (see below). Tree definitions don't replicate through normal Roblox replication, so this is the only way for a client to learn the tree's structure. |
 | `DebugSubscribe` | Client → Server | Buffer: `u32 treeId, u8 subscribe` (1 to start, 0 to stop). |
-| `DebugSnapshot` | Server → Client | Buffer: `u8 kind` (0=full, 1=delta), `u32 treeId`, `u32 tick`, `u8 paused`, node-state entries, then blackboard entries. |
+| `DebugTreePause` | Client → Server | Buffer: `u32 treeId, u8 paused` (1 to pause the tree, 0 to resume it). |
+| `DebugSnapshot` | Server → Client | Buffer: `u8 kind` (0=full, 1=delta), `u32 treeId`, `u32 tick`, `u8 paused`, node-state entries, task-param trace entries, then blackboard entries. |
 
-The first snapshot a subscriber receives is a full packet containing the last completed update trace for the tree and the complete serialized blackboard. Each subsequent packet sends the full visited-node trace for that update again, while only the blackboard portion is delta-compressed (`blackboardSet` / `blackboardRemoved`).
+The first snapshot a subscriber receives is a full packet containing the last completed update trace for the tree and the complete serialized blackboard. Each subsequent packet sends the full visited-node trace for that update again, plus the resolved task params for the task nodes that executed in that update, while only the blackboard portion is delta-compressed (`blackboardSet` / `blackboardRemoved`).
 
 `nodeStates` contains the final status of every node that was visited during the last completed `tree:update()`. Nodes that were not visited in that update are omitted entirely.
 
-Remote pause control is available through a `DebugTreePause` RemoteEvent. Its payload is `u32 treeId, u8 paused`, where `1` pauses the tree and `0` resumes it. The server applies the new pause state immediately and rebroadcasts a snapshot with the updated `paused` flag.
+`taskParams` is keyed by task-node DFS index and contains the resolved params observed by that task in the last completed update. Numbers are serialized as f64 values; every other param value is serialized as a string. Nil task params are sent as the string `"nil"`.
+
+Remote pause control is available through a `DebugTreePause` RemoteEvent. Its payload is `u32 treeId, u8 paused`, where `1` pauses the tree and `0` resumes it. The server applies the new pause state immediately by calling `tree:pause()` / `tree:resume()`, then rebroadcasts a snapshot with the updated `paused` flag.
+
+Tree-definition packets include task param schemas, not per-update task param values. For task nodes, the definition carries the optional task name plus any declared `module.params` entries as `{ key -> expected type }`.
 
 **Tree-definition packet format.** To avoid hardcoding a shared type enum on both server and client, every tree-definition packet starts with a self-describing type enum. The layout is:
 
@@ -247,8 +279,9 @@ repeat nodeCount times:
     u8  hasSize;  if 1: f32 x, f32 y
     u8  hasPosition; if 1: f32 x, f32 y
     -- type-specific payload:
-    --   task            : hasName (u8), optional len-prefixed name, u32 paramCount,
-    --                     repeat: len-prefixed key + value (tagged blackboard value)
+    --   task            : hasName (u8), optional len-prefixed name,
+    --                     u32 paramTypeCount, then repeated
+    --                     { len-prefixed key, len-prefixed typeName }
     --   parallel        : len-prefixed successPolicy, len-prefixed failurePolicy
     --   repeat / retry  : i32 times (-1 = infinite)
     --   randomSelector  : hasWeights (u8), optional u32 count + f32 weights
@@ -278,7 +311,7 @@ remotes.treeDefinition.OnClientEvent:Connect(function(buf)
     local packet = debugNetwork.decodeTreeDefinition(buf)
     for i, node in packet.nodes do
         -- node.type, node.children, node.singleChild, node.label,
-        -- node.taskName, node.taskParams, node.successPolicy, etc.
+        -- node.taskName, node.taskParamTypes, node.successPolicy, etc.
     end
 end)
 remotes.treeDefinition:FireServer(debugNetwork.encodeTreeDefinitionRequest(treeId))
@@ -288,6 +321,7 @@ remotes.snapshot.OnClientEvent:Connect(function(buf)
     local packet = debugNetwork.decodeSnapshot(buf)
     -- packet.kind == "full" | "delta"
     -- packet.nodeStates is the full visited-node trace for that update
+    -- packet.taskParams contains resolved params for task nodes visited in that update
     -- packet.blackboardSet / packet.blackboardRemoved are still deltas
 end)
 remotes.subscribe:FireServer(debugNetwork.encodeSubscribe(treeId, true))

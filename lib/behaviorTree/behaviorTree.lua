@@ -32,7 +32,12 @@
 --   -- Debug snapshots (opt-in via third parameter):
 --   local tree = BT.new(definition, blackboard, true)
 --   local status, snapshot = tree:update()
---   -- snapshot = { tick, paused, nodeStates: {[dfsIndex]: Status} }
+--   -- snapshot = {
+--   --     tick,
+--   --     paused,
+--   --     nodeStates: {[dfsIndex]: Status},
+--   --     taskParams: {[taskNodeIndex]: {[paramName]: resolvedValue}},
+--   -- }
 --
 --   -- Per-node debug callback (called before and after each node is ticked):
 --   local tree = BT.new(definition, blackboard, true)
@@ -49,15 +54,23 @@ export type Status = number
 export type Blackboard = { [any]: any }
 export type NodeMeta = { label: string?, size: Vector2?, position: Vector2? }
 
--- A flat string-keyed dictionary mapping each parameter name to its declared type.
--- Supported types: Lua primitives ("number", "string", "boolean"), "Vector2", "Vector3",
--- any Roblox Instance class name, and any of the above followed by "?" to mark as nullable.
+-- Legacy compatibility surface for task param schemas. The runtime no longer
+-- validates these values, but existing task modules may still expose them.
 export type ParamTypes = { [string]: string }
+export type ParamPathSegment = string | number
+export type ParamBinding = {
+	__btParamKind: "bind",
+	path: string,
+	segments: { ParamPathSegment },
+}
+export type ParamCalculation = {
+	__btParamKind: "calc",
+	resolver: (blackboard: Blackboard) -> any,
+}
 
 -- A task is a module script that returns a value of this type.
 export type BTreeTask = {
-	-- Optional type schema for this task's parameters. When present, BT.task() validates
-	-- that the params values passed at definition time match these declared types.
+	-- Optional legacy schema kept for compatibility. It is no longer enforced.
 	params: ParamTypes?,
 	-- Fires the first time a task is reached in a tick after not being reached in the previous tick.
 	-- Does not re-fire if the task continues to be reached every tick.
@@ -146,16 +159,20 @@ type FlatNode = {
 	activeLastTick: boolean, -- task: was this node reached in the previous tick?
 	activeThisTick: boolean, -- task: has this node been reached in the current tick?
 	wasRunning: boolean, -- task: did the previous execution of this node return RUNNING?
+	resolvedParams: { [string]: any }?, -- task: params resolved once for the current activation
 }
 
 -- Lightweight debug snapshot returned as the second value from tree:update()
 -- when the tree was created with debug=true. Contains only runtime state;
 -- structural information comes from the definition tree.
 -- nodeStates is keyed by 1-based DFS index (matching the FlatNode array position).
+-- taskParams contains the resolved params for task nodes visited in the last
+-- completed update; nil values are stringified as "nil" for debug transport.
 export type DebugSnapshot = {
 	tick: number,
 	paused: boolean,
 	nodeStates: { [number]: Status },
+	taskParams: { [number]: { [string]: any } },
 }
 
 export type DebugCallback = (nodeIndex: number, status: Status) -> ()
@@ -196,6 +213,39 @@ local function buildNodeStates(nodes: { FlatNode }): { [number]: Status }
 	return nodeStates
 end
 
+local function buildDebugTaskParams(nodes: { FlatNode }): { [number]: { [string]: any } }
+	local taskParams: { [number]: { [string]: any } } = {}
+	for i = 1, #nodes do
+		local node = nodes[i]
+		if node.definition._type == "task" and node.activeLastTick and node.resolvedParams ~= nil then
+			local def = node.definition :: TaskDef
+			local resolvedParams = node.resolvedParams :: { [any]: any }
+			local encodedParams: { [string]: any } = {}
+			local paramCount = 0
+			local seenKeys: { [string]: boolean } = {}
+			for rawKey in def.params do
+				local key = tostring(rawKey)
+				seenKeys[key] = true
+				encodedParams[key] = if resolvedParams[rawKey] == nil then "nil" else resolvedParams[rawKey]
+				paramCount += 1
+			end
+			local schema = def.module.params
+			if schema ~= nil then
+				for key in schema do
+					if not seenKeys[key] then
+						encodedParams[key] = if resolvedParams[key] == nil then "nil" else resolvedParams[key]
+						paramCount += 1
+					end
+				end
+			end
+			if paramCount > 0 then
+				taskParams[i] = encodedParams
+			end
+		end
+	end
+	return taskParams
+end
+
 -- Structural (immutable) fields extracted from a FlatNode for use as a construction template.
 type NodeTemplate = {
 	id: number,
@@ -223,63 +273,81 @@ local function newId(): number
 	return nextId
 end
 
--- Lua primitive types that can be validated with type().
-local PRIMITIVE_TYPES: { [string]: boolean } = {
-	number = true,
-	string = true,
-	boolean = true,
-}
+local PARAM_BIND_KIND = "bind"
+local PARAM_CALC_KIND = "calc"
 
--- Checks that a single param value matches its declared type string.
--- Errors (level 2 = BehaviorTree.task call site) if the value does not match.
--- Supported types: "number", "string", "boolean", "Vector2", "Vector3",
--- or any Roblox Instance class name. All params are implicitly nullable:
--- a nil value is always accepted regardless of the declared type.
-local function checkParam(paramName: string, value: any, declaredType: string)
-	if value == nil then
-		return
-	end
-
-	-- Lua primitives: validated with type().
-	if PRIMITIVE_TYPES[declaredType] then
-		local actualType = type(value)
-		if actualType ~= declaredType then
-			error(string.format("task param '%s': expected %s but got %s", paramName, declaredType, actualType), 2)
-		end
-		return
-	end
-
-	-- All other types (Vector2, Vector3, Roblox Instances, etc.): use typeof().
-	local actualTypeof = typeof(value)
-	if actualTypeof == declaredType then
-		return
-	end
-
-	-- Roblox Instance subclass check via :IsA().
-	if actualTypeof == "Instance" then
-		local ok, isA = pcall(function()
-			return (value :: any):IsA(declaredType)
-		end)
-		if ok and isA then
-			return
-		end
-		local className = (value :: any).ClassName or "Instance"
-		error(
-			string.format("task param '%s': expected Instance type %s but got %s", paramName, declaredType, className),
-			2
-		)
-	end
-
-	error(string.format("task param '%s': expected %s but got %s", paramName, declaredType, actualTypeof), 2)
+local function isParamBinding(value: any): boolean
+	return type(value) == "table" and value.__btParamKind == PARAM_BIND_KIND
 end
 
--- Validates all entries in a ParamTypes schema against the provided params values.
--- Errors on the first mismatch.
-local function validateTaskParams(schema: ParamTypes, params: { [string]: any }?)
-	local resolvedParams = params or {}
-	for paramName, declaredType in schema do
-		checkParam(paramName, resolvedParams[paramName], declaredType)
+local function isParamCalculation(value: any): boolean
+	return type(value) == "table" and value.__btParamKind == PARAM_CALC_KIND
+end
+
+local function parseBindingPath(path: string): { ParamPathSegment }
+	if path == "" then
+		error("BT.bind path must not be empty", 3)
 	end
+
+	local rawSegments = string.split(path, ".")
+	local segments: { ParamPathSegment } = {}
+	for i, rawSegment in rawSegments do
+		if rawSegment == "" then
+			error(`BT.bind path "{path}" contains an empty segment`, 3)
+		end
+		if string.match(rawSegment, "^%d+$") ~= nil then
+			segments[i] = tonumber(rawSegment) :: number
+		else
+			segments[i] = rawSegment
+		end
+	end
+	return segments
+end
+
+local function normalizeTaskParams(params: any?): { [string]: any }
+	if params == nil then
+		return {}
+	end
+	if type(params) ~= "table" then
+		error("BT.task params must be a table or nil", 3)
+	end
+	for paramName, value in params do
+		if type(value) == "function" then
+			error(
+				string.format(
+					"task param '%s': function values must be wrapped in BT.calc(...)",
+					tostring(paramName)
+				),
+				3
+			)
+		end
+	end
+	return params
+end
+
+local function resolveBinding(blackboard: Blackboard, binding: ParamBinding): any
+	local current: any = blackboard
+	for _, segment in binding.segments do
+		if current == nil or type(current) ~= "table" then
+			return nil
+		end
+		current = current[segment]
+	end
+	return current
+end
+
+local function resolveTaskParams(params: { [string]: any }, blackboard: Blackboard): { [string]: any }
+	local resolved: { [string]: any } = {}
+	for key, value in params do
+		if isParamBinding(value) then
+			resolved[key] = resolveBinding(blackboard, value :: ParamBinding)
+		elseif isParamCalculation(value) then
+			resolved[key] = (value :: ParamCalculation).resolver(blackboard)
+		else
+			resolved[key] = value
+		end
+	end
+	return resolved
 end
 
 -- Recursively allocates FlatNodes into `nodes` and packs their child indices into `childrenData`.
@@ -300,6 +368,7 @@ local function buildFlatTree(definition: NodeDefinition, nodes: { FlatNode }, ch
 		activeLastTick = false,
 		activeThisTick = false,
 		wasRunning = false,
+		resolvedParams = nil,
 	}
 	table.insert(nodes, node)
 
@@ -341,6 +410,7 @@ local function resetNode(nodeIndex: number, nodes: { FlatNode }, childrenData: {
 	node.activeChildIndex = 1
 	node.iterationCount = 0
 	node.wasRunning = false
+	node.resolvedParams = nil
 	for i = 1, node.childCount do
 		resetNode(childrenData[node.firstChild + i - 1], nodes, childrenData)
 	end
@@ -349,16 +419,25 @@ local function resetNode(nodeIndex: number, nodes: { FlatNode }, childrenData: {
 	end
 end
 
+local function getTaskResolvedParams(node: FlatNode, def: TaskDef, blackboard: Blackboard): { [string]: any }
+	if node.resolvedParams == nil then
+		node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard)
+	end
+	return node.resolvedParams
+end
+
 local function stopNode(nodeIndex: number, nodes: { FlatNode }, childrenData: { number }, blackboard: Blackboard)
 	local node = nodes[nodeIndex]
 	if node.definition._type == "task" and (node.activeThisTick or node.activeLastTick) then
 		local def = node.definition :: TaskDef
+		local params = getTaskResolvedParams(node, def, blackboard)
 		if def.module.onExit then
-			def.module.onExit(blackboard, def.params)
+			def.module.onExit(blackboard, params)
 		end
 		if def.module.onEnd and node.activeThisTick then
-			def.module.onEnd(blackboard, def.params)
+			def.module.onEnd(blackboard, params)
 		end
+		node.resolvedParams = nil
 	end
 	for i = 1, node.childCount do
 		stopNode(childrenData[node.firstChild + i - 1], nodes, childrenData, blackboard)
@@ -378,6 +457,7 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 	local node = nodes[nodeIndex]
 	local def = node.definition :: TaskDef
 	local mod = def.module
+	local taskParams: { [string]: any }
 
 	-- Capture the per-tree tick context before mod.run() can yield.
 	-- If another tree's update() runs during a yield it will overwrite treeRegistry[blackboard]
@@ -385,6 +465,11 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 	local ctx = treeRegistry[blackboard]
 
 	if not node.activeThisTick then
+		if not node.activeLastTick then
+			node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard)
+		end
+		taskParams = getTaskResolvedParams(node, def, blackboard)
+
 		-- Before entering this task, fire onExit for any earlier task nodes (lower DFS index)
 		-- that were active last tick but have been skipped this tick. This guarantees the
 		-- previous task's onExit fires before the incoming task's onEnter.
@@ -397,9 +482,11 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 					local candidate = ctx.nodes[candidateIdx]
 					if candidate.activeLastTick and not candidate.activeThisTick then
 						local candidateDef = candidate.definition :: TaskDef
+						local candidateParams = getTaskResolvedParams(candidate, candidateDef, blackboard)
 						if candidateDef.module.onExit then
-							candidateDef.module.onExit(blackboard, candidateDef.params)
+							candidateDef.module.onExit(blackboard, candidateParams)
 						end
+						candidate.resolvedParams = nil
 						ctx.leaveProcessed[candidateIdx] = true
 					end
 				end
@@ -408,25 +495,27 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 
 		if not node.activeLastTick then
 			if mod.onEnter then
-				mod.onEnter(blackboard, def.params)
+				mod.onEnter(blackboard, taskParams)
 			end
 		end
 		node.activeThisTick = true
+	else
+		taskParams = getTaskResolvedParams(node, def, blackboard)
 	end
 
 	-- onStart fires at the beginning of each fresh execution.
 	-- It does not fire when the task is resuming after returning RUNNING.
 	if not node.wasRunning then
 		if mod.onStart then
-			mod.onStart(blackboard, def.params)
+			mod.onStart(blackboard, taskParams)
 		end
 	end
 
 	-- run() may yield freely; tree:update() is assumed to be called inside a task.
-	local result = mod.run(blackboard, def.params)
+	local result = mod.run(blackboard, taskParams)
 
 	if mod.onEnd and result ~= RUNNING then
-		mod.onEnd(blackboard, def.params)
+		mod.onEnd(blackboard, taskParams)
 	end
 
 	-- RUNNING passes through; explicit FAILURE fails; anything else (including nil) succeeds.
@@ -795,6 +884,7 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			activeLastTick = false,
 			activeThisTick = false,
 			wasRunning = false,
+			resolvedParams = nil,
 		}
 	end
 
@@ -845,15 +935,21 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 		-- Advances the tree by one tick. Should be called once per frame.
 		-- When the tree is paused (via tree:pause()), returns the last status without ticking.
 		-- When debug mode is enabled, returns `(status, snapshot)` where snapshot is a
-		-- lightweight DebugSnapshot table containing tick count, paused state, and
-		-- per-node status keyed by 1-based DFS index.
+		-- lightweight DebugSnapshot table containing tick count, paused state,
+		-- per-node status keyed by 1-based DFS index, and resolved params for
+		-- any task nodes visited in the last completed update.
 		-- An optional `debugCallback` parameter can be provided; it will be called before
 		-- and after each node is ticked with `(nodeIndex, status)`. Before entry the status
 		-- is RUNNING; after the ticker completes it is the result status.
 		update = function(_self: Tree, debugCallback: DebugCallback?): (Status, DebugSnapshot?)
 			if paused then
 				if isDebug then
-					local snapshot = { tick = tickCount, paused = true, nodeStates = buildNodeStates(nodes) }
+					local snapshot = {
+						tick = tickCount,
+						paused = true,
+						nodeStates = buildNodeStates(nodes),
+						taskParams = buildDebugTaskParams(nodes),
+					}
 					return lastStatus, snapshot
 				end
 				return lastStatus
@@ -883,9 +979,12 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 						local n = nodes[candidateIdx]
 						if n.activeLastTick and not n.activeThisTick then
 							local def = n.definition :: TaskDef
+							local params = getTaskResolvedParams(n, def, blackboard)
 							if def.module.onExit then
-								def.module.onExit(blackboard, def.params)
+								def.module.onExit(blackboard, params)
 							end
+							n.resolvedParams = nil
+							ctx.leaveProcessed[candidateIdx] = true
 						end
 					end
 				end
@@ -895,6 +994,9 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			for i = 1, #nodes do
 				local n = nodes[i]
 				if n.definition._type == "task" then
+					if not n.activeThisTick then
+						n.resolvedParams = nil
+					end
 					n.activeLastTick = n.activeThisTick
 					n.activeThisTick = false
 				end
@@ -908,7 +1010,12 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			end
 
 			if isDebug then
-				return status, { tick = tickCount, paused = false, nodeStates = buildNodeStates(nodes) }
+				return status, {
+					tick = tickCount,
+					paused = false,
+					nodeStates = buildNodeStates(nodes),
+					taskParams = buildDebugTaskParams(nodes),
+				}
 			end
 
 			return status
@@ -948,14 +1055,32 @@ end
 
 -- Node definition builders
 
+function BehaviorTree.bind(path: string): ParamBinding
+	if type(path) ~= "string" then
+		error("BT.bind path must be a string", 2)
+	end
+	return {
+		__btParamKind = PARAM_BIND_KIND,
+		path = path,
+		segments = parseBindingPath(path),
+	}
+end
+
+function BehaviorTree.calc(resolver: (blackboard: Blackboard) -> any): ParamCalculation
+	if type(resolver) ~= "function" then
+		error("BT.calc resolver must be a function", 2)
+	end
+	return {
+		__btParamKind = PARAM_CALC_KIND,
+		resolver = resolver,
+	}
+end
+
 function BehaviorTree.task(module: BTreeTask, params: any?, meta: NodeMeta?): TaskDef
 	module.run = module.run or function()
 		return SUCCESS
 	end
-	local resolvedParams = if params == nil then {} else params
-	if module.params then
-		validateTaskParams(module.params, resolvedParams)
-	end
+	local resolvedParams = normalizeTaskParams(params)
 	local resolvedMeta: NodeMeta? = meta
 	if module.name ~= nil and (meta == nil or meta.label == nil) then
 		local withName: NodeMeta = if meta ~= nil then table.clone(meta) else {} :: NodeMeta
@@ -1051,6 +1176,8 @@ export type Library = {
 	FAILURE: Status,
 	RUNNING: Status,
 	new: (definition: NodeDefinition, blackboard: Blackboard, debug: (boolean | string)?) -> Tree,
+	bind: (path: string) -> ParamBinding,
+	calc: (resolver: (blackboard: Blackboard) -> any) -> ParamCalculation,
 	task: (module: BTreeTask, params: any?, meta: NodeMeta?) -> TaskDef,
 	condition: (check: (blackboard: Blackboard) -> boolean, meta: NodeMeta?) -> ConditionDef,
 	sequence: (children: { NodeDefinition }, meta: NodeMeta?) -> SequenceDef,
