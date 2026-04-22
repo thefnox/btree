@@ -160,22 +160,6 @@ local function readValue(r: Reader): any
 	error(`Unknown value tag {tag}`)
 end
 
--- Equality check used for diff tracking. Serialized blackboards only contain
--- primitives, strings, and Roblox value types — all of which support ==.
-local function valuesEqual(a: any, b: any): boolean
-	if a == b then
-		return true
-	end
-	local ta = typeof(a)
-	if ta ~= typeof(b) then
-		return false
-	end
-	if ta == "Vector3" or ta == "Vector2" or ta == "Color3" then
-		return a == b
-	end
-	return false
-end
-
 ------------------------------------------------------------------------
 -- Tree definition encoding
 ------------------------------------------------------------------------
@@ -560,12 +544,17 @@ local function encodeDeltaSnapshot(
 		writeU8(w, change.status)
 	end
 
+	-- Diff by direct `~=`. Callers are expected to have run the blackboard
+	-- through `serializeBlackboard` first, which leaves only primitives,
+	-- strings, and Roblox value types (Vector3/Vector2/Color3/CFrame) in the
+	-- map — all of which support value-equality via `==`. Nested tables and
+	-- Instances are reduced to strings by `serializeBlackboard`, so reference
+	-- identity never leaks into the diff.
 	local currentBb = frame.blackboard
 	local setEntries: { { key: string, value: any } } = {}
 	local removedKeys: { string } = {}
 	for key, value in currentBb do
-		local previous = previousBlackboard[key]
-		if previous == nil or not valuesEqual(previous, value) then
+		if previousBlackboard[key] ~= value then
 			table.insert(setEntries, { key = key, value = value })
 		end
 	end
@@ -736,5 +725,4 @@ return {
 	decodeTreeDefinitionRequest = decodeTreeDefinitionRequest,
 	buildTreeDefinitionResponse = buildTreeDefinitionResponse,
 	buildEmptyTreeDefinitionResponse = buildEmptyTreeDefinitionResponse,
-	valuesEqual = valuesEqual,
 }
