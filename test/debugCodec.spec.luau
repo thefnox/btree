@@ -344,4 +344,73 @@ return function(tiniest)
 			expect(decoded.blackboardSet.big).is(big)
 		end)
 	end)
+
+	describe("table value serialization", function()
+		test("serializeTableToString produces sorted deterministic output", function()
+			-- Keys must be sorted so the string is stable regardless of Lua
+			-- table iteration order.
+			local t = { z = 3, a = 1, m = 2 }
+			local s = codec.serializeTableToString(t)
+			expect(s).is("{a=1, m=2, z=3}")
+		end)
+
+		test("serializeTableToString on empty table", function()
+			expect(codec.serializeTableToString({})).is("{}")
+		end)
+
+		test("table blackboard value encodes as deterministic string, not a memory address", function()
+			-- serializeBlackboard returns nested tables as Lua tables at depth 1.
+			-- The codec must encode those as a readable string, not tostring(table).
+			local nested = { hp = 100, role = "scout" }
+			local frame = {
+				treeId = 1,
+				tick = 0,
+				paused = false,
+				nodeStates = {},
+				blackboard = { unit = nested },
+			}
+			local decoded = codec.decodeSnapshot(codec.encodeFullSnapshot(frame))
+			local encoded = decoded.blackboardSet.unit
+			-- Must be a deterministic string, not "table: 0x…"
+			expect(type(encoded)).is("string")
+			expect(encoded).is("{hp=100, role=scout}")
+		end)
+
+		test("delta does not emit table value that is content-equal to previous frame", function()
+			local nested = { hp = 100 }
+			local current = {
+				treeId = 1,
+				tick = 2,
+				paused = false,
+				nodeStates = {},
+				blackboard = { unit = nested },
+			}
+			-- Previous frame: a different table object with identical content.
+			local previousBb = { unit = { hp = 100 } }
+			local buf = codec.encodeDeltaSnapshot(current, {}, previousBb)
+			local decoded = codec.decodeSnapshot(buf)
+			-- Content is the same so no blackboard ops should be emitted.
+			local setCount = 0
+			for _ in decoded.blackboardSet do
+				setCount += 1
+			end
+			expect(setCount).is(0)
+			expect(#decoded.blackboardRemoved).is(0)
+		end)
+
+		test("delta emits table value when content changes between frames", function()
+			local current = {
+				treeId = 1,
+				tick = 3,
+				paused = false,
+				nodeStates = {},
+				blackboard = { unit = { hp = 50 } },
+			}
+			local previousBb = { unit = { hp = 100 } }
+			local buf = codec.encodeDeltaSnapshot(current, {}, previousBb)
+			local decoded = codec.decodeSnapshot(buf)
+			-- hp changed from 100 to 50, so unit must appear in the set ops.
+			expect(decoded.blackboardSet.unit).is("{hp=50}")
+		end)
+	end)
 end
