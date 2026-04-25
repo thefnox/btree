@@ -257,7 +257,7 @@ The first snapshot a subscriber receives is a full packet containing the last co
 
 `nodeStates` contains the final status of every node that was visited during the last completed `tree:update()`. Nodes that were not visited in that update are omitted entirely.
 
-`taskParams` is keyed by task-node DFS index and contains the resolved params observed by that task in the last completed update. Numbers are serialized as f64 values; every other param value is serialized as a string. Nil task params are sent as the string `"nil"`.
+`taskParams` is keyed by task-node DFS index and contains the resolved params observed by that task in the last completed update. Numbers are serialized as f64 values. `Vector3` and `Vector2` params are serialized as typed binary packets (3× or 2× f32 components) so clients reconstruct the native types directly. Native Luau `vector` values are serialized the same way. Every other param value is serialized as a string. Nil task params are sent as the string `"nil"`.
 
 Remote pause control is available through a `DebugTreePause` RemoteEvent. Its payload is `u32 treeId, u8 paused`, where `1` pauses the tree and `0` resumes it. The server applies the new pause state immediately by calling `tree:pause()` / `tree:resume()`, then rebroadcasts a snapshot with the updated `paused` flag.
 

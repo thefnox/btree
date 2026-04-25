@@ -48,6 +48,9 @@ local PACKET_DELTA: number = 1
 -- Per-task param value kinds used in snapshot packets.
 local TASK_PARAM_NUMBER: number = 0
 local TASK_PARAM_STRING: number = 1
+local TASK_PARAM_VECTOR3: number = 2
+local TASK_PARAM_VECTOR2: number = 3
+local TASK_PARAM_VECTOR: number = 4
 
 -- Per-key op codes used in delta packets.
 local BB_OP_REMOVE: number = 0
@@ -168,6 +171,20 @@ local function writeTaskParamValue(w: Writer, value: any)
 	if type(value) == "number" then
 		writeU8(w, TASK_PARAM_NUMBER)
 		writeF64(w, value)
+	elseif typeof(value) == "Vector3" then
+		writeU8(w, TASK_PARAM_VECTOR3)
+		writeF32(w, value.X)
+		writeF32(w, value.Y)
+		writeF32(w, value.Z)
+	elseif typeof(value) == "Vector2" then
+		writeU8(w, TASK_PARAM_VECTOR2)
+		writeF32(w, value.X)
+		writeF32(w, value.Y)
+	elseif typeof(value) == "vector" then
+		writeU8(w, TASK_PARAM_VECTOR)
+		writeF32(w, value.x)
+		writeF32(w, value.y)
+		writeF32(w, value.z)
 	else
 		writeU8(w, TASK_PARAM_STRING)
 		writeString(w, tostring(value))
@@ -180,6 +197,12 @@ local function readTaskParamValue(r: Reader): any
 		return readF64(r)
 	elseif tag == TASK_PARAM_STRING then
 		return readString(r)
+	elseif tag == TASK_PARAM_VECTOR3 then
+		return (Vector3 :: any).new(readF32(r), readF32(r), readF32(r))
+	elseif tag == TASK_PARAM_VECTOR2 then
+		return (Vector2 :: any).new(readF32(r), readF32(r))
+	elseif tag == TASK_PARAM_VECTOR then
+		return vector.create(readF32(r), readF32(r), readF32(r))
 	end
 	error(`Unknown task param value tag {tag}`)
 end
