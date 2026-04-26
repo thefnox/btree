@@ -1582,6 +1582,57 @@ return function(tiniest: tiniest_actual)
 			end).fails()
 		end)
 
+		test("BT.bind re-resolves and creates new params after completed executions", function()
+			local bb = { speed = 8 }
+			local captures: { any } = {}
+			local tree = BT.new(
+				BT.task({
+					run = function(_, p)
+						table.insert(captures, p)
+						return SUCCESS
+					end,
+				}, {
+					speed = BT.bind("speed"),
+				}),
+				bb
+			)
+			tree:update()
+			bb.speed = 20
+			tree:update()
+			expect(#captures).is(2)
+			expect(captures[1] == captures[2]).is(false)
+			expect(captures[1].speed).is(8)
+			expect(captures[2].speed).is(20)
+		end)
+
+		test("BT.bind keeps params stable while the previous execution is RUNNING", function()
+			local bb = { speed = 8 }
+			local captures: { any } = {}
+			local ticks = 0
+			local tree = BT.new(
+				BT.task({
+					run = function(_, p)
+						ticks += 1
+						table.insert(captures, p)
+						if ticks == 1 then
+							bb.speed = 20
+							return RUNNING
+						end
+						return SUCCESS
+					end,
+				}, {
+					speed = BT.bind("speed"),
+				}),
+				bb
+			)
+			tree:update()
+			tree:update()
+			expect(#captures).is(2)
+			expect(captures[1] == captures[2]).is(true)
+			expect(captures[1].speed).is(8)
+			expect(captures[2].speed).is(8)
+		end)
+
 		test("BT.calc resolves once per activation and stays stable across RUNNING ticks", function()
 			local bb = { speed = 8 }
 			local calcCount = 0

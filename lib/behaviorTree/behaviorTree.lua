@@ -465,7 +465,7 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 	local ctx = treeRegistry[blackboard]
 
 	if not node.activeThisTick then
-		if not node.activeLastTick then
+		if not node.wasRunning then
 			node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard)
 		end
 		taskParams = getTaskResolvedParams(node, def, blackboard)
