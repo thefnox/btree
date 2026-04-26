@@ -243,7 +243,7 @@ type NodeMeta = {
 
 ### Remote debugging
 
-In addition to the in-process `BTDebugSnapshot` BindableEvent, the server exposes five buffer-based RemoteEvents so clients can observe any tree created with debugging enabled. The RemoteEvents are lazily parented under the library script the first time a debug-enabled tree is registered, so non-debug builds carry no remote-event overhead.
+In addition to the in-process `BTDebugSnapshot` BindableEvent, the server exposes six buffer-based RemoteEvents so clients can observe any tree created with debugging enabled. The RemoteEvents are lazily parented under the library script the first time a debug-enabled tree is registered, so non-debug builds carry no remote-event overhead.
 
 | RemoteEvent | Direction | Payload |
 |---|---|---|
@@ -252,6 +252,7 @@ In addition to the in-process `BTDebugSnapshot` BindableEvent, the server expose
 | `DebugSubscribe` | Client → Server | Buffer: `u32 treeId, u8 subscribe` (1 to start, 0 to stop). |
 | `DebugTreePause` | Client → Server | Buffer: `u32 treeId, u8 paused` (1 to pause the tree, 0 to resume it). |
 | `DebugSnapshot` | Server → Client | Buffer: `u8 kind` (0=full, 1=delta), `u32 treeId`, `u32 tick`, `u8 paused`, node-state entries, task-param trace entries, then blackboard entries. |
+| `DebugOpenRequest` | Server → Client | Buffer: `u32 treeId`. Fired by the server (via `BT.openDebugViewer`) to a single targeted player so their Studio plugin can focus the matching tree's debug widget. |
 
 The first snapshot a subscriber receives is a full packet containing the last completed update trace for the tree and the complete serialized blackboard. Each subsequent packet sends the full visited-node trace for that update again, plus the resolved task params for the task nodes that executed in that update, while only the blackboard portion is delta-compressed (`blackboardSet` / `blackboardRemoved`).
 
@@ -329,7 +330,26 @@ remotes.subscribe:FireServer(debugNetwork.encodeSubscribe(treeId, true))
 -- Pause or resume the tree remotely.
 remotes.pause:FireServer(debugNetwork.encodePauseRequest(treeId, true)) -- pause
 remotes.pause:FireServer(debugNetwork.encodePauseRequest(treeId, false)) -- resume
+
+-- Listen for server-driven viewer-focus requests (Studio plugin only).
+remotes.openRequest.OnClientEvent:Connect(function(buf)
+    local treeId = debugNetwork.decodeOpenRequest(buf)
+    -- Plugin focuses its widget for `treeId`.
+end)
 ```
+
+### Opening the viewer from the server
+
+`BT.openDebugViewer(tree, player)` fires `DebugOpenRequest` to a single player so their Studio plugin focuses the matching tree's debug widget. Useful for jumping straight to the relevant tree when an interesting event happens in-game.
+
+```lua
+local tree = BT.new(definition, blackboard, script:GetFullName())
+
+-- Later, on the server:
+BT.openDebugViewer(tree, somePlayer)
+```
+
+Server-only. The tree must have been created with debug enabled (otherwise the call warns and is a no-op). Other Team Test sessions are not affected — only the targeted player's plugin receives the request.
 
 ## License
 

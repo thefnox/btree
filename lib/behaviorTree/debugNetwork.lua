@@ -43,6 +43,7 @@ type Remotes = {
 	subscribe: RemoteEvent,
 	pause: RemoteEvent,
 	snapshot: RemoteEvent,
+	openRequest: RemoteEvent,
 }
 
 local remotes: Remotes? = nil
@@ -163,12 +164,20 @@ local function ensureRemotes()
 	snapshot.Name = "DebugSnapshot"
 	snapshot.Parent = parentInstance
 
+	-- Server→client request for the plugin to focus a specific tree's debug
+	-- widget. Fired by debugNetwork.requestOpenViewer.
+	local openRequest = parentInstance:FindFirstChild("DebugOpenRequest") :: RemoteEvent?
+		or Instance.new("RemoteEvent")
+	openRequest.Name = "DebugOpenRequest"
+	openRequest.Parent = parentInstance
+
 	remotes = {
 		treeList = treeList,
 		treeDefinition = treeDefinition,
 		subscribe = subscribe,
 		pause = pause,
 		snapshot = snapshot,
+		openRequest = openRequest,
 	}
 
 	treeList.OnServerEvent:Connect(function(player)
@@ -305,11 +314,31 @@ function DebugNetwork.onTreeUpdated(
 	broadcastSnapshot(entry)
 end
 
+-- Server-only. Fires DebugOpenRequest to the given player only. That player's
+-- Studio plugin filters and acts on the request; other Team Test sessions are
+-- unaffected. No-op when treeId is unknown, when remotes haven't been built
+-- yet (no debug-enabled tree has registered, so no plugin can be listening
+-- anyway), or when the player argument is invalid.
+function DebugNetwork.requestOpenViewer(treeId: number, player: Player)
+	if not IS_SERVER or treeId == 0 or not remotes then
+		return
+	end
+	if trees[treeId] == nil then
+		return
+	end
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return
+	end
+	remotes.openRequest:FireClient(player, debugCodec.encodeOpenRequest(treeId))
+end
+
 -- Client helpers are re-exported from debugCodec so consumers don't need to
 -- reach into the codec module directly.
 DebugNetwork.encodeSubscribe = debugCodec.encodeSubscribe
 DebugNetwork.encodePauseRequest = debugCodec.encodePauseRequest
 DebugNetwork.encodeTreeDefinitionRequest = debugCodec.encodeTreeDefinitionRequest
+DebugNetwork.encodeOpenRequest = debugCodec.encodeOpenRequest
+DebugNetwork.decodeOpenRequest = debugCodec.decodeOpenRequest
 DebugNetwork.decodeTreeList = debugCodec.decodeTreeList
 DebugNetwork.decodeTreeDefinition = debugCodec.decodeTreeDefinition
 DebugNetwork.decodeSnapshot = debugCodec.decodeSnapshot
@@ -319,7 +348,7 @@ export type DefinitionNode = debugCodec.DefinitionNode
 export type TreeDefinitionPacket = debugCodec.TreeDefinitionPacket
 export type SnapshotPacket = debugCodec.SnapshotPacket
 
--- Client helper: returns the five RemoteEvents once the server has created
+-- Client helper: returns the six RemoteEvents once the server has created
 -- them. Yields until all exist. Returns nil if any does not appear within
 -- `timeout` seconds (when specified).
 function DebugNetwork.waitForRemotes(timeout: number?): Remotes?
@@ -334,13 +363,15 @@ function DebugNetwork.waitForRemotes(timeout: number?): Remotes?
 	local subscribe = waitFor("DebugSubscribe")
 	local pause = waitFor("DebugTreePause")
 	local snapshot = waitFor("DebugSnapshot")
-	if treeList and treeDefinition and subscribe and pause and snapshot then
+	local openRequest = waitFor("DebugOpenRequest")
+	if treeList and treeDefinition and subscribe and pause and snapshot and openRequest then
 		return {
 			treeList = treeList,
 			treeDefinition = treeDefinition,
 			subscribe = subscribe,
 			pause = pause,
 			snapshot = snapshot,
+			openRequest = openRequest,
 		}
 	end
 	return nil

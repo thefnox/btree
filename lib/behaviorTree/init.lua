@@ -99,6 +99,9 @@ function Wrapper.new(definition, blackboard, debug)
                 tree:resume()
             end
         end)
+        -- Surface the registered id so BT.openDebugViewer can target this
+        -- tree. 0 means debug disabled / called on client.
+        (tree :: any)._debugId = treeId
 
         local nativeUpdate = tree.update
         local lastRemoteNodeStates = {}
@@ -152,6 +155,31 @@ function Wrapper.new(definition, blackboard, debug)
     end
 
     return tree
+end
+
+-- Request the Studio plugin running with `player` to focus this tree's debug
+-- widget. Server-only; targets exactly one Studio session. The tree must have
+-- been created with debug enabled.
+function Wrapper.openDebugViewer(tree, player: Player)
+    local id: number = (tree :: any)._debugId or 0
+    if id == 0 then
+        warn(
+            "[BTree] openDebugViewer: tree has no debug id "
+                .. "(debug must be enabled when calling BT.new, and the call "
+                .. "must run on the server)"
+        )
+        return
+    end
+    if typeof(player) ~= "Instance" or not player:IsA("Player") then
+        warn(
+            "[BTree] openDebugViewer: player parameter is required and "
+                .. "must be a Player instance (got "
+                .. typeof(player)
+                .. ")"
+        )
+        return
+    end
+    debugNetwork.requestOpenViewer(id, player)
 end
 
 return Wrapper :: nativeBT.Library

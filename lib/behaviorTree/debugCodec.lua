@@ -802,6 +802,23 @@ local function decodeTreeDefinitionRequest(buf: buffer): number?
 	return readU32(r)
 end
 
+-- Script-triggered open-viewer request payload. Carries a single u32 treeId;
+-- the server fires it to a specific player and their Studio plugin opens the
+-- per-tree debug widget.
+local function encodeOpenRequest(treeId: number): buffer
+	local w = newWriter(4)
+	writeU32(w, treeId)
+	return finish(w)
+end
+
+local function decodeOpenRequest(buf: buffer): number?
+	if buffer.len(buf) < 4 then
+		return nil
+	end
+	local r = newReader(buf)
+	return readU32(r)
+end
+
 ------------------------------------------------------------------------
 -- Tree definition response helper
 ------------------------------------------------------------------------
@@ -841,6 +858,8 @@ return {
 	decodePauseRequest = decodePauseRequest,
 	encodeTreeDefinitionRequest = encodeTreeDefinitionRequest,
 	decodeTreeDefinitionRequest = decodeTreeDefinitionRequest,
+	encodeOpenRequest = encodeOpenRequest,
+	decodeOpenRequest = decodeOpenRequest,
 	buildTreeDefinitionResponse = buildTreeDefinitionResponse,
 	buildEmptyTreeDefinitionResponse = buildEmptyTreeDefinitionResponse,
 }
