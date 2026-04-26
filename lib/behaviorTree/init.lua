@@ -58,128 +58,127 @@ local event = script:FindFirstChild("BTDebugSnapshot")
 local Wrapper = {}
 
 local function cloneTaskParamTrace(taskParams: { [number]: { [string]: any } }?): { [number]: { [string]: any } }
-    local out: { [number]: { [string]: any } } = {}
-    if taskParams == nil then
-        return out
-    end
-    for nodeIndex, params in taskParams do
-        out[nodeIndex] = table.clone(params)
-    end
-    return out
+	local out: { [number]: { [string]: any } } = {}
+	if taskParams == nil then
+		return out
+	end
+	for nodeIndex, params in taskParams do
+		out[nodeIndex] = table.clone(params)
+	end
+	return out
 end
 
 -- Forward all constants and builder functions from the native library
 for key, value in nativeBT do
-    Wrapper[key] = value
+	Wrapper[key] = value
 end
-
 
 -- Override new to intercept update() and fire the BindableEvent when debug is enabled.
 function Wrapper.new(definition, blackboard, debug)
-    local definitionPath = ""
-    if type(debug) == "string" then
-        definitionPath = debug
-    end
+	local definitionPath = ""
+	if type(debug) == "string" then
+		definitionPath = debug
+	end
 
-    local tree = nativeBT.new(definition, blackboard, debug ~= nil and debug ~= false)
+	local tree = nativeBT.new(definition, blackboard, debug ~= nil and debug ~= false)
 
-    if debug then
-        local debugName = if type(blackboard) == "table" and blackboard._debugName
-            then tostring(blackboard._debugName)
-            else tostring(blackboard)
+	if debug then
+		local debugName = if type(blackboard) == "table" and blackboard._debugName
+			then tostring(blackboard._debugName)
+			else tostring(blackboard)
 
-        -- Register with the network-debug registry so clients can discover and
-        -- subscribe to this tree. Server-only; returns 0 on the client.
-        -- The definition is stored so clients can request its static structure
-        -- over the DebugTreeDefinition RemoteEvent.
-        local treeId = debugNetwork.registerTree(debugName, definitionPath, definition, function(paused)
-            if paused then
-                tree:pause()
-            else
-                tree:resume()
-            end
-        end)
-        -- Surface the registered id so BT.openDebugViewer can target this
-        -- tree. 0 means debug disabled / called on client.
-        (tree :: any)._debugId = treeId
+		-- Register with the network-debug registry so clients can discover and
+		-- subscribe to this tree. Server-only; returns 0 on the client.
+		-- The definition is stored so clients can request its static structure
+		-- over the DebugTreeDefinition RemoteEvent.
+		local treeId = debugNetwork.registerTree(debugName, definitionPath, definition, function(paused)
+			if paused then
+				tree:pause()
+			else
+				tree:resume()
+			end
+		end)
+		-- Surface the registered id so BT.openDebugViewer can target this
+		-- tree. 0 means debug disabled / called on client.
+		tree._debugId = treeId
 
-        local nativeUpdate = tree.update
-        local lastRemoteNodeStates = {}
-        local lastRemoteTaskParams = {}
-        tree.update = function(self)
-            local nodeStates = {}
-            local function onNodeUpdate(nodeIndex, status)
-                nodeStates[nodeIndex] = status
-            end
-            local status, nativeSnapshot = nativeUpdate(self, onNodeUpdate)
-            local isPaused = nativeSnapshot ~= nil and nativeSnapshot.paused == true
-            if nativeSnapshot ~= nil and not isPaused then
-                -- Preserve the terminal status of every node visited during the
-                -- last completed update. While paused there is no new trace, so
-                -- the remote debugger should continue seeing the prior update's
-                -- visited-node map instead of being overwritten by an empty one.
-                lastRemoteNodeStates = table.clone(nodeStates)
-            end
-            if nativeSnapshot ~= nil then
-                lastRemoteTaskParams = cloneTaskParamTrace(nativeSnapshot.taskParams)
-            end
-            local emittedNodeStates = if isPaused then lastRemoteNodeStates else nodeStates
-            local emittedTaskParams = lastRemoteTaskParams
-            if not isPaused then
-                emittedTaskParams = if nativeSnapshot then nativeSnapshot.taskParams else {}
-            end
-            if event and (next(nodeStates) or isPaused) then
-                event:Fire(definitionPath, debugName, {
-                    tick = if nativeSnapshot then nativeSnapshot.tick else nil,
-                    paused = isPaused,
-                    nodeStates = emittedNodeStates,
-                    taskParams = emittedTaskParams,
-                    blackboard = serializeBlackboard(blackboard),
-                })
-            end
-            -- Forward the visited-node execution trace to the remote debugger.
-            -- Unlike the native snapshot, this preserves the final status of
-            -- every node actually visited during the last completed update.
-            if treeId ~= 0 and nativeSnapshot ~= nil then
-                debugNetwork.onTreeUpdated(
-                    treeId,
-                    nativeSnapshot.tick,
-                    isPaused,
-                    lastRemoteNodeStates,
-                    lastRemoteTaskParams,
-                    blackboard
-                )
-            end
-            return status, nativeSnapshot
-        end
-    end
+		local nativeUpdate = tree.update
+		local lastRemoteNodeStates = {}
+		local lastRemoteTaskParams = {}
+		tree.update = function(self)
+			local nodeStates = {}
+			local function onNodeUpdate(nodeIndex, status)
+				nodeStates[nodeIndex] = status
+			end
+			local status, nativeSnapshot = nativeUpdate(self, onNodeUpdate)
+			local isPaused = nativeSnapshot ~= nil and nativeSnapshot.paused == true
+			if nativeSnapshot ~= nil and not isPaused then
+				-- Preserve the terminal status of every node visited during the
+				-- last completed update. While paused there is no new trace, so
+				-- the remote debugger should continue seeing the prior update's
+				-- visited-node map instead of being overwritten by an empty one.
+				lastRemoteNodeStates = table.clone(nodeStates)
+			end
+			if nativeSnapshot ~= nil then
+				lastRemoteTaskParams = cloneTaskParamTrace(nativeSnapshot.taskParams)
+			end
+			local emittedNodeStates = if isPaused then lastRemoteNodeStates else nodeStates
+			local emittedTaskParams = lastRemoteTaskParams
+			if not isPaused then
+				emittedTaskParams = if nativeSnapshot then nativeSnapshot.taskParams else {}
+			end
+			if event and (next(nodeStates) or isPaused) then
+				event:Fire(definitionPath, debugName, {
+					tick = if nativeSnapshot then nativeSnapshot.tick else nil,
+					paused = isPaused,
+					nodeStates = emittedNodeStates,
+					taskParams = emittedTaskParams,
+					blackboard = serializeBlackboard(blackboard),
+				})
+			end
+			-- Forward the visited-node execution trace to the remote debugger.
+			-- Unlike the native snapshot, this preserves the final status of
+			-- every node actually visited during the last completed update.
+			if treeId ~= 0 and nativeSnapshot ~= nil then
+				debugNetwork.onTreeUpdated(
+					treeId,
+					nativeSnapshot.tick,
+					isPaused,
+					lastRemoteNodeStates,
+					lastRemoteTaskParams,
+					blackboard
+				)
+			end
+			return status, nativeSnapshot
+		end
+	end
 
-    return tree
+	return tree
 end
 
 -- Request the Studio plugin running with `player` to focus this tree's debug
 -- widget. Server-only; targets exactly one Studio session. The tree must have
 -- been created with debug enabled.
 function Wrapper.openDebugViewer(tree, player: Player)
-    local id: number = (tree :: any)._debugId or 0
-    if id == 0 then
-        warn(
-            "[BTree] openDebugViewer: tree has no debug id "
-                .. "(debug must be enabled when calling BT.new, and the call "
-                .. "must run on the server)"
-        )
-        return
-    end
-    if typeof(player) ~= "Instance" or not player:IsA("Player") then
-        warn(
-            "[BTree] openDebugViewer: player parameter is required and "
-                .. "must be a Player instance (got "
-                .. typeof(player)
-                .. ")"
-        )
-        return
-    end
-    debugNetwork.requestOpenViewer(id, player)
+	local id: number = (tree :: any)._debugId or 0
+	if id == 0 then
+		warn(
+			"[BTree] openDebugViewer: tree has no debug id "
+				.. "(debug must be enabled when calling BT.new, and the call "
+				.. "must run on the server)"
+		)
+		return
+	end
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		warn(
+			"[BTree] openDebugViewer: player parameter is required and "
+				.. "must be a Player instance (got "
+				.. typeof(player)
+				.. ")"
+		)
+		return
+	end
+	debugNetwork.requestOpenViewer(id, player)
 end
 
 return Wrapper :: nativeBT.Library
