@@ -447,6 +447,26 @@ local function stopNode(nodeIndex: number, nodes: { FlatNode }, childrenData: { 
 	end
 end
 
+-- Re-asserts activeThisTick for the still-active task nodes of a subtree. A
+-- parallel stops re-ticking a child once it has finished (SUCCESS/FAILURE), but
+-- that child is still part of the parallel's active branch until the parallel
+-- itself terminates. Without this, the leave-detection would see the finished
+-- child as "not reached this tick" and fire its onExit prematurely, mid-parallel.
+-- Only nodes that were genuinely active last tick are retained, so branches that
+-- were never entered (e.g. an untaken selector child) are left untouched.
+local function retainActiveSubtree(nodeIndex: number, nodes: { FlatNode }, childrenData: { number })
+	local node = nodes[nodeIndex]
+	if node.definition._type == "task" and node.activeLastTick then
+		node.activeThisTick = true
+	end
+	for i = 1, node.childCount do
+		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData)
+	end
+	if node.child ~= 0 then
+		retainActiveSubtree(node.child, nodes, childrenData)
+	end
+end
+
 -- tickNode is forward-declared so that composite ticker functions can reference it.
 -- It is assigned at the bottom of the ticker block.
 type Ticker = (nodeIndex: number, nodes: { FlatNode }, childrenData: { number }, blackboard: Blackboard) -> Status
@@ -606,6 +626,17 @@ tickers["parallel"] = function(
 	local def = node.definition :: ParallelDef
 	local successCount = 0
 	local failureCount = 0
+
+	-- Keep children that finished on an earlier tick marked active before any
+	-- sibling is ticked this frame. Ticking a running sibling can fire the
+	-- inline leave-detection, which would otherwise exit a finished child while
+	-- the parallel is still going.
+	for i = 1, node.childCount do
+		local childIndex = childrenData[node.firstChild + i - 1]
+		if nodes[childIndex].status ~= RUNNING then
+			retainActiveSubtree(childIndex, nodes, childrenData)
+		end
+	end
 
 	for i = 1, node.childCount do
 		local childIndex = childrenData[node.firstChild + i - 1]

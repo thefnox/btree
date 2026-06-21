@@ -351,6 +351,57 @@ BT.openDebugViewer(tree, somePlayer)
 
 Server-only. The tree must have been created with debug enabled (otherwise the call warns and is a no-op). Other Team Test sessions are not affected — only the targeted player's plugin receives the request.
 
+## Running tests
+
+The test suite runs under [Lune](https://lune-lang.org/) using the bundled
+[`tiniest`](https://github.com/dphfox/tiniest) runner. Lune is installed via
+[Rokit](https://github.com/rojo-rbx/rokit) from `rokit.toml`.
+
+```sh
+# One-time: install the pinned toolchain (lune, etc.)
+rokit install
+
+# Run the whole suite
+lune run test/test_main
+```
+
+`test/test_main.luau` is the entry point. It configures `tiniest`, then collects
+and runs every `*.spec.luau` file via `describe_from_file(...)`. To add a new
+test file, create `test/<name>.spec.luau` that returns a
+`function(tiniest)` and register it with another `describe_from_file("<name>")`
+line in `test/test_main.luau`.
+
+Each spec receives the configured `tiniest` instance and uses `describe`,
+`test`, and `expect`:
+
+```lua
+-- test/example.spec.luau
+local BT = require("../lib/behaviorTree/behaviorTree")
+
+type tiniest_actual = typeof(require("../tiniest/tiniest_for_lune").configure({}))
+
+return function(tiniest: tiniest_actual)
+    local describe, test, expect = tiniest.describe, tiniest.test, tiniest.expect
+
+    describe("my feature", function()
+        test("does the thing", function()
+            expect(BT.new(BT.task(SUCCEED), {}):update()).is(BT.SUCCESS)
+        end)
+    end)
+end
+```
+
+Notes for writing tests under Lune:
+
+- Lune's `task.wait(0)` does not reliably yield to other threads the way the
+  Roblox/zune schedulers do. For tests that exercise yielding tasks, use small
+  positive durations (see `YIELD_DUR` / `SYNC_DUR` in
+  [`test/behaviorTree.spec.luau`](test/behaviorTree.spec.luau)).
+- Snapshot tests are gated behind `SAVE_SNAPSHOTS` in `test/test_main.luau`;
+  leave it `false` to assert against the committed snapshots under
+  `test/__snapshots__/`, and flip it to `true` only when intentionally
+  regenerating them.
+
 ## License
 
 MIT

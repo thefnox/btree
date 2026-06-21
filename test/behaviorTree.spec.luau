@@ -1801,6 +1801,137 @@ return function(tiniest: tiniest_actual)
 			tree:update()
 			expect(exitCount).is(1)
 		end)
+
+		-- A task that finishes (SUCCESS) inside a parallel is still part of the
+		-- parallel's active branch until the parallel itself is left. Its onExit
+		-- must not fire just because the parallel stopped re-ticking it while a
+		-- sibling keeps running.
+		test("a finished parallel child does not exit while the parallel keeps running", function()
+			local exits = 0
+			local def = BT.parallel({
+				BT.task({
+					onExit = function()
+						exits += 1
+					end,
+					run = function()
+						return SUCCESS
+					end,
+				}),
+				BT.task({
+					run = function()
+						return RUNNING
+					end,
+				}),
+			}, "requireAll", "requireAll")
+			local tree = BT.new(def, {})
+			tree:update() -- child A succeeds, sibling RUNNING -> parallel RUNNING
+			tree:update() -- parallel still RUNNING; A must not have exited
+			tree:update()
+			expect(exits).is(0)
+		end)
+
+		-- onExit for a finished parallel child fires exactly once, when the
+		-- parallel branch is actually left (here, when the enclosing sequence
+		-- moves past the parallel onto a later sibling).
+		test("a finished parallel child exits once when the parallel branch is left", function()
+			local exits = 0
+			local siblingTicks = 0
+			local def = BT.sequence({
+				BT.parallel({
+					BT.task({
+						onExit = function()
+							exits += 1
+						end,
+						run = function()
+							return SUCCESS
+						end,
+					}),
+					BT.task({
+						run = function()
+							siblingTicks += 1
+							return if siblingTicks < 3 then RUNNING else SUCCESS
+						end,
+					}),
+				}, "requireAll", "requireAll"),
+				BT.task({
+					run = function()
+						return RUNNING
+					end,
+				}),
+			})
+			local tree = BT.new(def, {})
+			tree:update() -- t1: A succeeds, parallel RUNNING
+			tree:update() -- t2: parallel RUNNING
+			expect(exits).is(0)
+			tree:update() -- t3: parallel terminates; sequence still visits it this tick
+			expect(exits).is(0)
+			tree:update() -- t4: sequence parks on the next sibling, parallel left -> A exits
+			expect(exits).is(1)
+			tree:update() -- t5: no further exits
+			expect(exits).is(1)
+		end)
+
+		-- End-to-end: a realistic priority selector driven over many ticks. Each
+		-- task that becomes active fires onEnter once and onExit once when control
+		-- moves elsewhere, with no missing or duplicated callbacks.
+		test("onEnter/onExit pair correctly across a realistic multi-tick priority selector", function()
+			local bb = { canSeeEnemy = false, hearsNoise = false }
+			local log: { string } = {}
+			local function durative(name: string, ticks: number): BT.BTreeTask
+				local remaining = ticks
+				return {
+					onEnter = function()
+						table.insert(log, name .. ".enter")
+					end,
+					onExit = function()
+						table.insert(log, name .. ".exit")
+					end,
+					run = function()
+						remaining -= 1
+						if remaining <= 0 then
+							remaining = ticks
+							return SUCCESS
+						end
+						return RUNNING
+					end,
+				}
+			end
+			local tree = BT.new(
+				BT.selector({
+					BT.sequence({
+						BT.condition(function()
+							return bb.canSeeEnemy
+						end),
+						BT.task(durative("Attack", 2)),
+					}),
+					BT.sequence({
+						BT.condition(function()
+							return bb.hearsNoise
+						end),
+						BT.task(durative("Investigate", 2)),
+					}),
+					BT.task(durative("Patrol", 3)),
+				}),
+				bb
+			)
+
+			tree:update() -- t1: Patrol.enter
+			tree:update() -- t2
+			bb.hearsNoise = true
+			tree:update() -- t3: Patrol finishes its third tick
+			tree:update() -- t4: Investigate.enter, Patrol.exit
+			bb.canSeeEnemy = true
+			tree:update() -- t5: Investigate finishes
+			tree:update() -- t6: Attack.enter, Investigate.exit
+			bb.canSeeEnemy = false
+			bb.hearsNoise = false
+			tree:update() -- t7: Attack finishes
+			tree:update() -- t8: Attack.exit, Patrol.enter
+
+			expect(table.concat(log, ",")).is(
+				"Patrol.enter,Investigate.enter,Patrol.exit,Attack.enter,Investigate.exit,Attack.exit,Patrol.enter"
+			)
+		end)
 	end)
 
 	------------------------------------------------------------------------
