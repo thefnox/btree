@@ -286,6 +286,15 @@ function DebugNetwork.registerTree(
 	return id
 end
 
+-- Removes a debug tree and all of its subscriber and snapshot state. Safe to
+-- call repeatedly or with an unknown id.
+function DebugNetwork.unregisterTree(treeId: number)
+	if not IS_SERVER then
+		return
+	end
+	trees[treeId] = nil
+end
+
 -- Called by the wrapper after each tree:update(). `nodeStates` is the final
 -- visited-node trace for the last completed update, `taskParams` carries the
 -- resolved params for the task nodes visited in that same update, and

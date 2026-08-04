@@ -186,7 +186,12 @@ local tree = BT.new(definition, blackboard, true)
 
 -- Pass the script path so the plugin can locate the definition source
 local tree = BT.new(definition, blackboard, script:GetFullName())
+
+-- Optionally associate the registered tree with a Roblox instance
+local tree = BT.new(definition, blackboard, true, npcModel)
 ```
+
+When the optional fourth `debugTarget` argument is supplied and the server registers the tree, the wrapper adds the `BehaviorTreeDebugTarget` CollectionService tag and stores the tree id in the target's `BehaviorTreeDebugTreeId` attribute. This lets debug tooling discover the tree from its in-world instance. `tree:destroy()` removes the tag and attribute only while the attribute still names that tree, so destroying an older tree cannot clear a target that has since been claimed by another tree.
 
 The `DebugSnapshot` contains:
 
@@ -261,6 +266,8 @@ The first snapshot a subscriber receives is a full packet containing the last co
 `taskParams` is keyed by task-node DFS index and contains the resolved params observed by that task in the last completed update. Numbers are serialized as f64 values. `Vector3` and `Vector2` params are serialized as typed binary packets (3× or 2× f32 components) so clients reconstruct the native types directly. Native Luau `vector` values are serialized the same way. Every other param value is serialized as a string. Nil task params are sent as the string `"nil"`.
 
 Remote pause control is available through a `DebugTreePause` RemoteEvent. Its payload is `u32 treeId, u8 paused`, where `1` pauses the tree and `0` resumes it. The server applies the new pause state immediately by calling `tree:pause()` / `tree:resume()`, then rebroadcasts a snapshot with the updated `paused` flag.
+
+Call `tree:destroy()` before releasing a debug-enabled tree. The call is idempotent: it removes the tree and all of its subscriptions and cached snapshots from the debug registry, then stops both network and legacy `BTDebugSnapshot` publication for that runtime. The native tree remains usable, but no longer appears in tree-list or definition requests and cannot receive remote pause commands.
 
 Tree-definition packets include task param schemas, not per-update task param values. For task nodes, the definition carries the optional task name plus any declared `module.params` entries as `{ key -> expected type }`.
 

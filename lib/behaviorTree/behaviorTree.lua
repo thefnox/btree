@@ -184,6 +184,9 @@ export type Tree = {
 	pause: (self: Tree) -> (),
 	resume: (self: Tree) -> (),
 	isPaused: (self: Tree) -> boolean,
+	destroy: (self: Tree) -> (),
+	_debugSetPaused: (paused: boolean) -> (),
+	_debugId: number?,
 }
 
 -- Per-tree runtime context used during a tick to fire onExit callbacks inline,
@@ -940,6 +943,9 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 	local paused = false
 	local lastStatus: Status = RUNNING
 	local isDebug = debug and true or false
+	local function setPaused(value: boolean)
+		paused = value
+	end
 
 	local function resetTreeRuntime(resumeAfterReset: boolean)
 		resetNode(rootIndex, nodes, childrenData)
@@ -1067,18 +1073,26 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 
 		-- Pauses the tree so that subsequent update() calls are no-ops.
 		pause = function(_self: Tree)
-			paused = true
+			setPaused(true)
 		end,
 
 		-- Resumes a paused tree so that update() ticks normally again.
 		resume = function(_self: Tree)
-			paused = false
+			setPaused(false)
 		end,
 
 		-- Returns whether the tree is currently paused.
 		isPaused = function(_self: Tree): boolean
 			return paused
 		end,
+
+		-- The native runtime owns no external resources. The Roblox wrapper
+		-- replaces this with debug-network teardown when debugging is enabled.
+		destroy = function(_self: Tree) end,
+
+		-- Internal pause control for the Roblox debug registry. This closure only
+		-- captures the paused scalar, never the tree table or its runtime arrays.
+		_debugSetPaused = setPaused,
 	}
 
 	return tree

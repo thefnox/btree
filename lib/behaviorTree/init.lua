@@ -22,6 +22,8 @@
 --   -- or simply:
 --   local tree = BT.new(definition, blackboard, true)
 
+local CollectionService = game:GetService("CollectionService")
+
 local nativeBT = require("@self/behaviorTree")
 local serializeBlackboard = require("@self/serializeBlackboard")
 local debugNetwork = require("@self/debugNetwork")
@@ -51,9 +53,20 @@ export type NodeDefinition = nativeBT.NodeDefinition
 export type DebugSnapshot = nativeBT.DebugSnapshot
 export type DebugCallback = nativeBT.DebugCallback
 export type Tree = nativeBT.Tree
-export type Library = nativeBT.Library
+export type Library = nativeBT.Library & {
+	new: (
+		definition: NodeDefinition,
+		blackboard: Blackboard,
+		debug: (boolean | string)?,
+		debugTarget: Instance?
+	) -> Tree,
+	openDebugViewer: (tree: Tree, player: Player) -> (),
+}
 
 local event = script:FindFirstChild("BTDebugSnapshot")
+
+local DEBUG_TARGET_TAG = "BehaviorTreeDebugTarget"
+local DEBUG_TREE_ID_ATTRIBUTE = "BehaviorTreeDebugTreeId"
 
 local Wrapper = {}
 
@@ -74,7 +87,13 @@ for key, value in nativeBT do
 end
 
 -- Override new to intercept update() and fire the BindableEvent when debug is enabled.
-function Wrapper.new(definition, blackboard, debug)
+-- A debug target is tagged with the registered tree id for instance-based discovery.
+function Wrapper.new(
+	definition: NodeDefinition,
+	blackboard: Blackboard,
+	debug: (boolean | string)?,
+	debugTarget: Instance?
+): Tree
 	local definitionPath = ""
 	if type(debug) == "string" then
 		definitionPath = debug
@@ -91,21 +110,24 @@ function Wrapper.new(definition, blackboard, debug)
 		-- subscribe to this tree. Server-only; returns 0 on the client.
 		-- The definition is stored so clients can request its static structure
 		-- over the DebugTreeDefinition RemoteEvent.
-		local treeId = debugNetwork.registerTree(debugName, definitionPath, definition, function(paused)
-			if paused then
-				tree:pause()
-			else
-				tree:resume()
-			end
-		end)
+		local treeId: number = debugNetwork.registerTree(debugName, definitionPath, definition, tree._debugSetPaused)
 		-- Surface the registered id so BT.openDebugViewer can target this
 		-- tree. 0 means debug disabled / called on client.
 		tree._debugId = treeId
+		local target: Instance? = if treeId ~= 0 then debugTarget else nil
+		if target then
+			CollectionService:AddTag(target, DEBUG_TARGET_TAG)
+			target:SetAttribute(DEBUG_TREE_ID_ATTRIBUTE, treeId)
+		end
 
 		local nativeUpdate = tree.update
+		local debugDisposed = false
 		local lastRemoteNodeStates = {}
 		local lastRemoteTaskParams = {}
 		tree.update = function(self)
+			if debugDisposed then
+				return nativeUpdate(self)
+			end
 			local nodeStates = {}
 			local function onNodeUpdate(nodeIndex, status)
 				nodeStates[nodeIndex] = status
@@ -151,6 +173,22 @@ function Wrapper.new(definition, blackboard, debug)
 			end
 			return status, nativeSnapshot
 		end
+		tree.destroy = function(self)
+			if debugDisposed then
+				return
+			end
+			debugDisposed = true
+			if treeId ~= 0 then
+				debugNetwork.unregisterTree(treeId)
+				if target and target:GetAttribute(DEBUG_TREE_ID_ATTRIBUTE) == treeId then
+					CollectionService:RemoveTag(target, DEBUG_TARGET_TAG)
+					target:SetAttribute(DEBUG_TREE_ID_ATTRIBUTE, nil)
+				end
+				treeId = 0
+				self._debugId = 0
+			end
+			target = nil
+		end
 	end
 
 	return tree
@@ -159,7 +197,7 @@ end
 -- Request the Studio plugin running with `player` to focus this tree's debug
 -- widget. Server-only; targets exactly one Studio session. The tree must have
 -- been created with debug enabled.
-function Wrapper.openDebugViewer(tree, player: Player)
+function Wrapper.openDebugViewer(tree: Tree, player: Player)
 	local id: number = (tree :: any)._debugId or 0
 	if id == 0 then
 		warn(
@@ -181,4 +219,4 @@ function Wrapper.openDebugViewer(tree, player: Player)
 	debugNetwork.requestOpenViewer(id, player)
 end
 
-return Wrapper :: nativeBT.Library
+return Wrapper :: Library

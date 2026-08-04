@@ -1347,6 +1347,87 @@ return function(tiniest: tiniest_actual)
 			expect(exitCount).is(1)
 		end)
 
+		test("interrupting a parallel fires onExit once for both finished and running children", function()
+			-- Child A finishes on tick 1 but is retained as part of the parallel's
+			-- active branch; child B keeps running. Stopping the tree must fire
+			-- onExit exactly once for each, without re-firing A's onEnd.
+			local aExit, aEnd, bExit = 0, 0, 0
+			local siblingTicks = 0
+			local tree = BT.new(
+				BT.parallel({
+					BT.task({
+						onExit = function()
+							aExit += 1
+						end,
+						onEnd = function()
+							aEnd += 1
+						end,
+						run = function()
+							return SUCCESS
+						end,
+					}),
+					BT.task({
+						onExit = function()
+							bExit += 1
+						end,
+						run = function()
+							siblingTicks += 1
+							return RUNNING
+						end,
+					}),
+				}, "requireAll", "requireAll"),
+				{}
+			)
+
+			tree:update() -- A succeeds, B running, parallel RUNNING
+			tree:update() -- parallel still running, A retained
+			tree:stop()
+
+			expect(aExit).is(1)
+			expect(bExit).is(1)
+			expect(aEnd).is(1) -- A.onEnd fired once at completion, not again on stop
+		end)
+
+		test("re-enters cleanly after interrupting a parallel", function()
+			-- After stop(), the next update must start a fresh activation: every
+			-- child re-enters and no stale onExit leaks from the interrupted run.
+			local log: { string } = {}
+			local tree = BT.new(
+				BT.parallel({
+					BT.task({
+						onEnter = function()
+							table.insert(log, "A.enter")
+						end,
+						onExit = function()
+							table.insert(log, "A.exit")
+						end,
+						run = function()
+							return SUCCESS
+						end,
+					}),
+					BT.task({
+						onEnter = function()
+							table.insert(log, "B.enter")
+						end,
+						onExit = function()
+							table.insert(log, "B.exit")
+						end,
+						run = function()
+							return RUNNING
+						end,
+					}),
+				}, "requireAll", "requireAll"),
+				{}
+			)
+
+			tree:update()
+			tree:stop()
+			table.clear(log)
+			tree:update() -- fresh activation
+
+			expect(table.concat(log, ",")).is("A.enter,B.enter")
+		end)
+
 		test("resets iteration count so the next update cannot reach the terminal iteration", function()
 			local def = BT.repeatNode(BT.task(SUCCEED), 2)
 			local tree = BT.new(def, {})
