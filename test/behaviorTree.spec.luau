@@ -1291,7 +1291,7 @@ return function(tiniest: tiniest_actual)
 	------------------------------------------------------------------------
 
 	describe("reset", function()
-		test("rewinds execution to the root without firing interruption exits", function()
+		test("fires interruption exits and rewinds execution to the root", function()
 			local log: { string } = {}
 			local exitCount = 0
 			local def = BT.sequence({
@@ -1315,18 +1315,156 @@ return function(tiniest: tiniest_actual)
 			local tree = BT.new(def, {})
 			tree:update()
 			tree:reset()
+
+			expect(exitCount).is(1)
+
 			tree:update()
 
-			expect(exitCount).is(0)
+			-- No stale exit fires on the fresh activation after the reset.
+			expect(exitCount).is(1)
 			expect(#log).is(4)
 			expect(log[1]).is("A")
 			expect(log[2]).is("B")
 			expect(log[3]).is("A")
 			expect(log[4]).is("B")
 		end)
+
+		test("preserves pause state", function()
+			local tree = BT.new(BT.task({
+				run = function()
+					return RUNNING
+				end,
+			}), {})
+
+			tree:update()
+			tree:pause()
+			tree:reset()
+
+			expect(tree:isPaused()).is(true)
+		end)
+	end)
+
+	describe("destroy", function()
+		test("fires onEnd and onExit for tasks that were active when the tree was destroyed", function()
+			local exitCount = 0
+			local endCount = 0
+			local tree = BT.new(
+				BT.task({
+					onExit = function()
+						exitCount += 1
+					end,
+					onEnd = function()
+						endCount += 1
+					end,
+					run = function()
+						return RUNNING
+					end,
+				}),
+				{}
+			)
+
+			tree:update()
+			tree:destroy()
+
+			expect(exitCount).is(1)
+			expect(endCount).is(1)
+		end)
+
+		test("is idempotent", function()
+			local exitCount = 0
+			local tree = BT.new(
+				BT.task({
+					onExit = function()
+						exitCount += 1
+					end,
+					run = function()
+						return RUNNING
+					end,
+				}),
+				{}
+			)
+
+			tree:update()
+			tree:destroy()
+			tree:destroy()
+
+			expect(exitCount).is(1)
+		end)
+
+		test("does not fire onExit for tasks that were never reached", function()
+			local exitCount = 0
+			local tree = BT.new(
+				BT.sequence({
+					BT.condition(function()
+						return false
+					end),
+					BT.task({
+						onExit = function()
+							exitCount += 1
+						end,
+					}),
+				}),
+				{}
+			)
+
+			tree:update()
+			tree:destroy()
+
+			expect(exitCount).is(0)
+		end)
 	end)
 
 	describe("stop", function()
+		test("ends an interrupted running task as FAILURE, firing onEnd before onExit", function()
+			local log: { string } = {}
+			local tree = BT.new(
+				BT.task({
+					onEnd = function()
+						table.insert(log, "end")
+					end,
+					onExit = function()
+						table.insert(log, "exit")
+					end,
+					run = function()
+						return RUNNING
+					end,
+				}),
+				{}
+			)
+
+			tree:update()
+			tree:stop()
+
+			expect(table.concat(log, ",")).is("end,exit")
+		end)
+
+		test("does not re-fire onEnd for a task that already completed", function()
+			local endCount = 0
+			local tree = BT.new(
+				BT.sequence({
+					BT.task({
+						onEnd = function()
+							endCount += 1
+						end,
+						run = function()
+							return SUCCESS
+						end,
+					}),
+					BT.task({
+						run = function()
+							return RUNNING
+						end,
+					}),
+				}),
+				{}
+			)
+
+			tree:update() -- first task completes (onEnd fires), second is RUNNING
+			tree:stop()
+
+			expect(endCount).is(1)
+		end)
+
 		test("fires onExit for tasks that were active when the tree was stopped", function()
 			local exitCount = 0
 			local tree = BT.new(

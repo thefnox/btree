@@ -173,7 +173,11 @@ function Wrapper.new(
 			end
 			return status, nativeSnapshot
 		end
+		local nativeDestroy = tree.destroy
 		tree.destroy = function(self)
+			-- Fire pending onExit/onEnd for tasks still active in the current
+			-- execution. Idempotent, so calling destroy twice is safe.
+			nativeDestroy(self)
 			if debugDisposed then
 				return
 			end

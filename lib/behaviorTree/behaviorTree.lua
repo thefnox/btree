@@ -79,7 +79,9 @@ export type BTreeTask = {
 	onExit: ((blackboard: Blackboard, params: any) -> ())?,
 	-- Called once when the task starts a fresh execution. Not called when resuming after RUNNING.
 	onStart: ((blackboard: Blackboard, params: any) -> ())?,
-	-- Called once when the task exits with SUCCESS or FAILURE (not called when returning RUNNING).
+	-- Called once when the task exits with SUCCESS or FAILURE (not called when returning
+	-- RUNNING). A task interrupted mid-execution (via stop/reset/destroy or a terminating
+	-- parallel) is ended as FAILURE, firing onEnd before onExit.
 	onEnd: ((blackboard: Blackboard, params: any) -> ())?,
 	-- Main task body.
 	-- Return BT.FAILURE to fail, or return nothing / BT.SUCCESS to succeed.
@@ -94,7 +96,8 @@ type TaskModule = {
 	onExit: ((blackboard: Blackboard, params: any) -> ())?,
 	-- Called once when the task starts a fresh execution. Not called when resuming after RUNNING.
 	onStart: ((blackboard: Blackboard, params: any) -> ())?,
-	-- Called once when the task exits with SUCCESS or FAILURE (not called when returning RUNNING).
+	-- Called once when the task exits with SUCCESS or FAILURE (not called when returning
+	-- RUNNING). Interrupted tasks are ended as FAILURE, firing onEnd before onExit.
 	onEnd: ((blackboard: Blackboard, params: any) -> ())?,
 	-- Main task body.
 	-- Return BT.FAILURE to fail, or return nothing / BT.SUCCESS to succeed.
@@ -434,11 +437,18 @@ local function stopNode(nodeIndex: number, nodes: { FlatNode }, childrenData: { 
 	if node.definition._type == "task" and (node.activeThisTick or node.activeLastTick) then
 		local def = node.definition :: TaskDef
 		local params = getTaskResolvedParams(node, def, blackboard)
+		-- A task that was mid-execution (its last run returned RUNNING) is forcibly
+		-- ended as FAILURE: onEnd fires once, then onExit. Tasks that already
+		-- completed had onEnd fired at completion, so only onExit fires for them.
+		if node.wasRunning then
+			node.status = FAILURE
+			node.wasRunning = false
+			if def.module.onEnd then
+				def.module.onEnd(blackboard, params)
+			end
+		end
 		if def.module.onExit then
 			def.module.onExit(blackboard, params)
-		end
-		if def.module.onEnd and node.activeThisTick then
-			def.module.onEnd(blackboard, params)
 		end
 		node.resolvedParams = nil
 	end
@@ -1058,9 +1068,11 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			return status
 		end,
 
-		-- Resets the tree to its initial state without firing interruption callbacks.
-		-- The next update starts from the root. Pause state is preserved.
+		-- Interrupts any tasks active in the current execution (firing their onExit/onEnd
+		-- cleanup hooks), then resets the tree to its initial state so the next update
+		-- reevaluates from the root. Pause state is preserved.
 		reset = function(_self: Tree)
+			stopNode(rootIndex, nodes, childrenData, blackboard)
 			resetTreeRuntime(false)
 		end,
 
@@ -1086,9 +1098,14 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			return paused
 		end,
 
-		-- The native runtime owns no external resources. The Roblox wrapper
-		-- replaces this with debug-network teardown when debugging is enabled.
-		destroy = function(_self: Tree) end,
+		-- Permanently interrupts the tree: fires pending onExit/onEnd for any tasks
+		-- active in the current execution, then clears runtime state. Safe to call
+		-- more than once. The Roblox wrapper chains debug-network teardown onto this
+		-- when debugging is enabled.
+		destroy = function(_self: Tree)
+			stopNode(rootIndex, nodes, childrenData, blackboard)
+			resetTreeRuntime(false)
+		end,
 
 		-- Internal pause control for the Roblox debug registry. This closure only
 		-- captures the paused scalar, never the tree table or its runtime arrays.

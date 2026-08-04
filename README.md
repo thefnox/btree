@@ -111,9 +111,9 @@ return {
 | Callback | When it fires |
 |---|---|
 | `onEnter` | First tick this node is reached after not being reached last tick |
-| `onExit` | When a previously reached task is no longer active, including `tree:stop()` |
+| `onExit` | When a previously reached task is no longer active, including `tree:stop()`, `tree:reset()`, and `tree:destroy()` |
 | `onStart` | When a fresh execution of the task begins |
-| `onEnd` | When the task exits with `SUCCESS` or `FAILURE` |
+| `onEnd` | When the task exits with `SUCCESS` or `FAILURE`. An interrupted mid-execution task ends as `FAILURE`, firing `onEnd` before `onExit` |
 | `run` | Every tick while active — return `RUNNING` to stay active, `FAILURE` to fail, or nothing / `SUCCESS` to succeed |
 
 ### Subtrees
@@ -169,11 +169,12 @@ return BT.sequence({
 
 ```lua
 tree:update()           -- tick once, returns (Status, DebugSnapshot?)
-tree:reset()            -- rewind runtime state to the root without firing interruption callbacks
-tree:stop()             -- fire onExit for active tasks, rewind, and resume so the next update starts at the root
+tree:reset()            -- interrupt active tasks (onEnd/onExit) and rewind runtime state to the root (pause state preserved)
+tree:stop()             -- interrupt active tasks (onEnd/onExit), rewind, and resume so the next update starts at the root
 tree:pause()            -- suspend ticking
 tree:resume()           -- resume ticking
 tree:isPaused()         -- returns boolean
+tree:destroy()          -- fire onExit for active tasks and tear down; safe to call more than once
 ```
 
 ## Debug mode

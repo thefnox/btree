@@ -280,6 +280,7 @@ return function(tiniest: tiniest_actual)
 					_debugSetPaused = function(value: boolean)
 						paused = value
 					end,
+					destroy = function() end,
 				}
 			end
 			local debugNetwork = {
