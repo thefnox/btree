@@ -75,7 +75,10 @@ export type BTreeTask = {
 	-- Fires the first time a task is reached in a tick after not being reached in the previous tick.
 	-- Does not re-fire if the task continues to be reached every tick.
 	onEnter: ((blackboard: Blackboard, params: any) -> ())?,
-	-- Fires when a task that was reached last tick is not reached in the current tick.
+	-- Fires when the branch containing this task is left: the tree takes a different
+	-- branch, or the tree is stopped/reset/destroyed. A task that already completed
+	-- inside a still-running sequence, selector, or parallel is retained as part of
+	-- that composite's active branch, so it does not exit mid-execution.
 	onExit: ((blackboard: Blackboard, params: any) -> ())?,
 	-- Called once when the task starts a fresh execution. Not called when resuming after RUNNING.
 	onStart: ((blackboard: Blackboard, params: any) -> ())?,
@@ -576,6 +579,16 @@ tickers["sequence"] = function(
 	blackboard: Blackboard
 ): Status
 	local node = nodes[nodeIndex]
+
+	-- Children before the resume point completed on an earlier tick, but they are
+	-- still part of this sequence's active branch until the sequence itself
+	-- terminates or is left. Keep their tasks marked active so the leave-detection
+	-- does not fire their onExit mid-sequence (mirrors the retention the parallel
+	-- ticker applies to its finished children).
+	for i = 1, node.activeChildIndex - 1 do
+		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData)
+	end
+
 	while node.activeChildIndex <= node.childCount do
 		local childIndex = childrenData[node.firstChild + node.activeChildIndex - 1]
 		local status = tickNode(childIndex, nodes, childrenData, blackboard)
@@ -606,6 +619,16 @@ tickers["selector"] = function(
 	blackboard: Blackboard
 ): Status
 	local node = nodes[nodeIndex]
+
+	-- Children before the resume point failed on an earlier tick, but they are
+	-- still part of this selector's active branch until the selector itself
+	-- terminates or is left. Keep their tasks marked active so the leave-detection
+	-- does not fire their onExit mid-selector (mirrors the retention the parallel
+	-- ticker applies to its finished children).
+	for i = 1, node.activeChildIndex - 1 do
+		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData)
+	end
+
 	while node.activeChildIndex <= node.childCount do
 		local childIndex = childrenData[node.firstChild + node.activeChildIndex - 1]
 		local status = tickNode(childIndex, nodes, childrenData, blackboard)

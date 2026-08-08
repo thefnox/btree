@@ -111,7 +111,7 @@ return {
 | Callback | When it fires |
 |---|---|
 | `onEnter` | First tick this node is reached after not being reached last tick |
-| `onExit` | When a previously reached task is no longer active, including `tree:stop()`, `tree:reset()`, and `tree:destroy()` |
+| `onExit` | When the branch containing the task is left: the tree takes a different branch, or `tree:stop()`, `tree:reset()`, `tree:destroy()`. A completed task inside a still-running sequence/selector/parallel is retained until that composite's execution ends |
 | `onStart` | When a fresh execution of the task begins |
 | `onEnd` | When the task exits with `SUCCESS` or `FAILURE`. An interrupted mid-execution task ends as `FAILURE`, firing `onEnd` before `onExit` |
 | `run` | Every tick while active — return `RUNNING` to stay active, `FAILURE` to fail, or nothing / `SUCCESS` to succeed |

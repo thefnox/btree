@@ -1989,10 +1989,11 @@ return function(tiniest: tiniest_actual)
 			expect(captures[2].speed).is(20)
 		end)
 
-		test("onExit fires when tree finishes and a previously ticked task is not reached", function()
+		test("a finished sequence child is retained through completion and exits on destroy", function()
 			-- Scenario: sequence resumes from a later child on tick 2, skipping a task
-			-- that was ticked on tick 1. The tree finishes (SUCCESS) but the skipped
-			-- task's onExit must still fire.
+			-- that succeeded on tick 1. The earlier child is still part of the
+			-- sequence's active branch, so finishing the tree does not exit it; the
+			-- exit fires when the branch is actually left (here, via destroy).
 			local exitCount = 0
 			local taskBTicks = 0
 			local def = BT.sequence({
@@ -2015,9 +2016,11 @@ return function(tiniest: tiniest_actual)
 			-- Tick 1: TaskA succeeds, TaskB returns RUNNING -> both active this tick.
 			-- sequence.activeChildIndex stays at TaskB (2).
 			tree:update()
-			-- Tick 2: sequence resumes at TaskB (skips TaskA) -> TaskB succeeds -> tree SUCCESS.
-			-- TaskA was active last tick but not reached this tick -> onExit should fire.
+			-- Tick 2: sequence resumes at TaskB (retaining TaskA) -> TaskB succeeds -> tree SUCCESS.
+			-- TaskA remains part of the completed execution's branch: no exit yet.
 			tree:update()
+			expect(exitCount).is(0)
+			tree:destroy()
 			expect(exitCount).is(1)
 		end)
 
@@ -2049,10 +2052,12 @@ return function(tiniest: tiniest_actual)
 			expect(exits).is(0)
 		end)
 
-		-- onExit for a finished parallel child fires exactly once, when the
-		-- parallel branch is actually left (here, when the enclosing sequence
-		-- moves past the parallel onto a later sibling).
-		test("a finished parallel child exits once when the parallel branch is left", function()
+		-- onExit for a finished parallel child fires exactly once, when the branch
+		-- containing it is actually left. The enclosing sequence moving past the
+		-- parallel onto a later sibling does NOT leave the branch -- the parallel
+		-- is still part of the sequence's current execution -- so the exit fires
+		-- only when that execution is abandoned (here, via stop).
+		test("a finished parallel child exits once when the enclosing branch is left", function()
 			local exits = 0
 			local siblingTicks = 0
 			local def = BT.sequence({
@@ -2084,9 +2089,112 @@ return function(tiniest: tiniest_actual)
 			expect(exits).is(0)
 			tree:update() -- t3: parallel terminates; sequence still visits it this tick
 			expect(exits).is(0)
-			tree:update() -- t4: sequence parks on the next sibling, parallel left -> A exits
+			tree:update() -- t4: sequence parks on the next sibling; parallel retained -> no exit
+			expect(exits).is(0)
+			tree:update() -- t5: still no exit while the sequence keeps running
+			expect(exits).is(0)
+			tree:stop() -- the sequence's execution is abandoned -> A exits once
+			expect(exits).is(1)
+		end)
+
+		-- A task that succeeds early in a sequence is still part of the sequence's
+		-- active branch while the sequence resumes from a later RUNNING child. Its
+		-- onExit must not fire just because the sequence stopped re-ticking it.
+		test("a finished sequence child does not exit while the sequence keeps running", function()
+			local exits = 0
+			local def = BT.sequence({
+				BT.task({
+					onExit = function()
+						exits += 1
+					end,
+					run = function()
+						return SUCCESS
+					end,
+				}),
+				BT.task({
+					run = function()
+						return RUNNING
+					end,
+				}),
+			})
+			local tree = BT.new(def, {})
+			tree:update() -- t1: A succeeds, B RUNNING -> sequence RUNNING
+			tree:update() -- t2: sequence resumes at B; A retained -> no exit
+			tree:update() -- t3: same
+			expect(exits).is(0)
+		end)
+
+		-- onExit for a finished sequence child fires exactly once, when the
+		-- sequence branch is actually left (here, when its guard condition fails
+		-- and the selector falls through to another branch).
+		test("a finished sequence child exits once when the sequence branch is left", function()
+			local exits = 0
+			local taskBTicks = 0
+			local flag = true
+			local def = BT.selector({
+				BT.sequence({
+					BT.condition(function()
+						return flag
+					end),
+					BT.task({
+						onExit = function()
+							exits += 1
+						end,
+						run = function()
+							return SUCCESS
+						end,
+					}),
+					BT.task({
+						run = function()
+							taskBTicks += 1
+							return if taskBTicks < 3 then RUNNING else SUCCESS
+						end,
+					}),
+				}),
+				BT.task({
+					run = function()
+						return RUNNING
+					end,
+				}),
+			})
+			local tree = BT.new(def, {})
+			tree:update() -- t1: condition passes, A succeeds, B RUNNING
+			tree:update() -- t2: sequence resumes at B; A retained
+			expect(exits).is(0)
+			tree:update() -- t3: B succeeds -> sequence SUCCESS -> selector SUCCESS; no exit yet
+			expect(exits).is(0)
+			flag = false
+			tree:update() -- t4: guard fails, selector takes the fallback -> A exits
 			expect(exits).is(1)
 			tree:update() -- t5: no further exits
+			expect(exits).is(1)
+		end)
+
+		-- A child that failed early in a selector is still part of the selector's
+		-- active branch while the selector resumes from a later RUNNING child.
+		test("a failed selector child does not exit while the selector keeps running", function()
+			local exits = 0
+			local def = BT.selector({
+				BT.task({
+					onExit = function()
+						exits += 1
+					end,
+					run = function()
+						return FAILURE
+					end,
+				}),
+				BT.task({
+					run = function()
+						return RUNNING
+					end,
+				}),
+			})
+			local tree = BT.new(def, {})
+			tree:update() -- t1: A fails, B RUNNING -> selector RUNNING
+			tree:update() -- t2: selector resumes at B; A retained -> no exit
+			tree:update() -- t3: same
+			expect(exits).is(0)
+			tree:stop() -- leaving the selector's execution exits A once
 			expect(exits).is(1)
 		end)
 
