@@ -9,6 +9,7 @@ A behavior tree library for Roblox, written in Luau.
 - Full Luau strict-mode types
 - Binding-based task params via `BT.bind(...)` and `BT.calc(...)`
 - Subtree inlining — subtrees are merged into the parent flat array at build time
+- Parameterizable subtrees via tree vars (`BT.var(...)` with per-include overrides and defaults)
 - Pause/resume support
 - Debug snapshots with per-node status, compatible with the BTree Studio plugin
 
@@ -129,6 +130,35 @@ return BT.sequence({
 })
 ```
 
+#### Tree vars
+
+Subtrees are parameterizable via tree vars, which makes them truly reusable. Inside the subtree, reference a var with `BT.var(name, default?)` wherever a task param is expected. At the include site, supply values through the `vars` table of `BT.subtree`:
+
+```lua
+-- PatrolLoop.lua — a reusable subtree with a `speed` var defaulting to 12
+return BT.sequence({
+    BT.task(MoveToWaypoint, { speed = BT.var("speed", 12) }),
+    BT.task(ScanArea),
+})
+
+-- Consumer — overrides the default
+BT.subtree(PatrolLoop, { speed = 20 })
+```
+
+Resolution rules:
+
+- The nearest enclosing `BT.subtree` node that supplies the var wins; if none does, the var's `default` is used (else `nil`).
+- Vars are resolved once per task activation, with the same lifecycle as `BT.bind`/`BT.calc`.
+- Supplied values may themselves be `BT.bind(...)` or `BT.calc(...)` (resolved against the blackboard), or `BT.var(...)`, which forwards a var from the *outer* scope so nested subtrees compose:
+
+```lua
+-- Squad.lua re-exposes its own `groupSpeed` var to the PatrolLoop it embeds
+return BT.subtree(PatrolLoop, { speed = BT.var("groupSpeed", 10) })
+
+-- Root
+BT.subtree(Squad, { groupSpeed = 16 })
+```
+
 ## Node reference
 
 ### Composites
@@ -156,7 +186,7 @@ return BT.sequence({
 |---|---|
 | `BT.task(module, params?, meta?)` | Runs a task module. |
 | `BT.condition(check, meta?)` | Calls `check(blackboard)` — returns `SUCCESS` if true, `FAILURE` if false. |
-| `BT.subtree(module, meta?)` | Inlines another definition tree. |
+| `BT.subtree(module, vars?, meta?)` | Inlines another definition tree. `vars` supplies values for `BT.var(...)` references inside it. |
 
 ### Param helpers
 
@@ -164,6 +194,7 @@ return BT.sequence({
 |---|---|
 | `BT.bind(path)` | Resolves a dot-separated blackboard path once when the task activation begins. Numeric segments index arrays/tables by number. |
 | `BT.calc(resolver)` | Calls `resolver(blackboard)` once when the task activation begins and stores the returned value in the resolved params table. |
+| `BT.var(name, default?)` | Resolves a tree var supplied by the nearest enclosing `BT.subtree` node's `vars` table, falling back to `default` (which may itself be a `BT.bind`, `BT.calc`, or `BT.var`). |
 
 ### Tree API
 
@@ -216,6 +247,7 @@ Top-level param entries may be:
 - literals, which are copied into the resolved params table unchanged
 - `BT.bind("path.to.value")`, which nil-safely traverses the blackboard using dot-separated path segments
 - `BT.calc(function(bb) ... end)`, which computes a value from the current blackboard
+- `BT.var("name", default?)`, which resolves a tree var supplied by an enclosing `BT.subtree` node (see [Tree vars](#tree-vars))
 
 Nested tables are treated as literals and are not recursively resolved. Bare top-level function values are not allowed; wrap computed values with `BT.calc(...)` instead.
 

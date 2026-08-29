@@ -67,6 +67,11 @@ export type ParamCalculation = {
 	__btParamKind: "calc",
 	resolver: (blackboard: Blackboard) -> any,
 }
+export type ParamVar = {
+	__btParamKind: "var",
+	name: string,
+	default: any,
+}
 
 -- A task is a module script that returns a value of this type.
 export type BTreeTask = {
@@ -128,7 +133,9 @@ export type AlwaysSucceedDef = BaseDefinition & { _type: "alwaysSucceed", child:
 export type AlwaysFailDef = BaseDefinition & { _type: "alwaysFail", child: NodeDefinition? }
 -- The root of the subtree is retained as a pass-through marker so the visual editor can identify
 -- the boundary, but all nodes are inlined into the parent tree's flat arrays at build time.
-export type SubtreeDef = BaseDefinition & { _type: "subtree", module: NodeDefinition }
+-- `vars` supplies values for BT.var(...) references inside the subtree; the nearest enclosing
+-- subtree node that supplies a var wins, so nested subtrees compose like function calls.
+export type SubtreeDef = BaseDefinition & { _type: "subtree", module: NodeDefinition, vars: { [string]: any }? }
 -- weights must be the same length as children if provided. Missing entries default to 0.
 export type RandomSelectorDef = BaseDefinition & {
 	_type: "randomSelector",
@@ -166,6 +173,7 @@ type FlatNode = {
 	activeThisTick: boolean, -- task: has this node been reached in the current tick?
 	wasRunning: boolean, -- task: did the previous execution of this node return RUNNING?
 	resolvedParams: { [string]: any }?, -- task: params resolved once for the current activation
+	varScope: { { [string]: any } }?, -- task: enclosing subtree vars tables, innermost first
 }
 
 -- Lightweight debug snapshot returned as the second value from tree:update()
@@ -262,6 +270,7 @@ type NodeTemplate = {
 	firstChild: number,
 	childCount: number,
 	child: number,
+	varScope: { { [string]: any } }?,
 }
 
 type CachedTreeStructure = {
@@ -284,6 +293,10 @@ end
 
 local PARAM_BIND_KIND = "bind"
 local PARAM_CALC_KIND = "calc"
+local PARAM_VAR_KIND = "var"
+
+-- Safety cap for chains of BT.var defaults that reference other vars.
+local MAX_VAR_RESOLUTION_DEPTH = 32
 
 local function isParamBinding(value: any): boolean
 	return type(value) == "table" and value.__btParamKind == PARAM_BIND_KIND
@@ -291,6 +304,10 @@ end
 
 local function isParamCalculation(value: any): boolean
 	return type(value) == "table" and value.__btParamKind == PARAM_CALC_KIND
+end
+
+local function isParamVar(value: any): boolean
+	return type(value) == "table" and value.__btParamKind == PARAM_VAR_KIND
 end
 
 local function parseBindingPath(path: string): { ParamPathSegment }
@@ -323,10 +340,7 @@ local function normalizeTaskParams(params: any?): { [string]: any }
 	for paramName, value in params do
 		if type(value) == "function" then
 			error(
-				string.format(
-					"task param '%s': function values must be wrapped in BT.calc(...)",
-					tostring(paramName)
-				),
+				string.format("task param '%s': function values must be wrapped in BT.calc(...)", tostring(paramName)),
 				3
 			)
 		end
@@ -345,16 +359,62 @@ local function resolveBinding(blackboard: Blackboard, binding: ParamBinding): an
 	return current
 end
 
-local function resolveTaskParams(params: { [string]: any }, blackboard: Blackboard): { [string]: any }
+-- A task node's var scope: the `vars` tables of its enclosing subtree nodes,
+-- ordered innermost first. Built once per node position at tree-build time.
+type VarScope = { { [string]: any } }
+
+-- Resolves a param value that may be a BT.bind, BT.calc, BT.var, or a literal.
+-- `startIndex` is the position in `varScope` to start searching from when the
+-- value is a var reference; a subtree's own vars table entries resolve against
+-- the scopes *outside* that subtree, which is what startIndex advances past.
+local resolveScopedValue: (value: any, varScope: VarScope?, startIndex: number, blackboard: Blackboard, depth: number) -> any
+
+local function resolveVarRef(
+	varRef: ParamVar,
+	varScope: VarScope?,
+	startIndex: number,
+	blackboard: Blackboard,
+	depth: number
+): any
+	if varScope ~= nil then
+		for i = startIndex, #varScope do
+			local supplied = varScope[i][varRef.name]
+			if supplied ~= nil then
+				return resolveScopedValue(supplied, varScope, i + 1, blackboard, depth)
+			end
+		end
+	end
+	return resolveScopedValue(varRef.default, varScope, startIndex, blackboard, depth)
+end
+
+resolveScopedValue = function(
+	value: any,
+	varScope: VarScope?,
+	startIndex: number,
+	blackboard: Blackboard,
+	depth: number
+): any
+	if isParamBinding(value) then
+		return resolveBinding(blackboard, value :: ParamBinding)
+	elseif isParamCalculation(value) then
+		return (value :: ParamCalculation).resolver(blackboard)
+	elseif isParamVar(value) then
+		if depth >= MAX_VAR_RESOLUTION_DEPTH then
+			error(`BT.var "{(value :: ParamVar).name}": var resolution exceeded max depth (cyclic var defaults?)`)
+		end
+		return resolveVarRef(value :: ParamVar, varScope, startIndex, blackboard, depth + 1)
+	end
+	return value
+end
+
+local function resolveTaskParams(
+	params: { [string]: any },
+	blackboard: Blackboard,
+	varScope: VarScope?
+): { [string]: any }
 	local resolved: { [string]: any } = {}
 	for key, value in params do
-		if isParamBinding(value) then
-			resolved[key] = resolveBinding(blackboard, value :: ParamBinding)
-		elseif isParamCalculation(value) then
-			resolved[key] = (value :: ParamCalculation).resolver(blackboard)
-		else
-			resolved[key] = value
-		end
+		resolved[key] = resolveScopedValue(value, varScope, 1, blackboard, 0)
 	end
 	return resolved
 end
@@ -362,7 +422,15 @@ end
 -- Recursively allocates FlatNodes into `nodes` and packs their child indices into `childrenData`.
 -- Children for each composite are reserved as a contiguous slice before their subtrees are built,
 -- ensuring the slice positions are stable even as deeper nodes append further entries.
-local function buildFlatTree(definition: NodeDefinition, nodes: { FlatNode }, childrenData: { number }): number
+-- `varsStack` holds the `vars` tables of the subtree nodes currently being descended
+-- into, outermost first. Task nodes snapshot it (reversed, so lookups start at the
+-- nearest enclosing subtree) into their varScope.
+local function buildFlatTree(
+	definition: NodeDefinition,
+	nodes: { FlatNode },
+	childrenData: { number },
+	varsStack: { { [string]: any } }
+): number
 	local nodeIndex = #nodes + 1
 	local node: FlatNode = {
 		id = newId(),
@@ -378,12 +446,27 @@ local function buildFlatTree(definition: NodeDefinition, nodes: { FlatNode }, ch
 		activeThisTick = false,
 		wasRunning = false,
 		resolvedParams = nil,
+		varScope = nil,
 	}
 	table.insert(nodes, node)
 
 	local nodeType = definition._type
 
-	if nodeType == "sequence" or nodeType == "selector" or nodeType == "parallel" or nodeType == "randomSelector" then
+	if nodeType == "task" then
+		local depth = #varsStack
+		if depth > 0 then
+			local scope: { { [string]: any } } = table.create(depth)
+			for i = 1, depth do
+				scope[i] = varsStack[depth - i + 1]
+			end
+			node.varScope = scope
+		end
+	elseif
+		nodeType == "sequence"
+		or nodeType == "selector"
+		or nodeType == "parallel"
+		or nodeType == "randomSelector"
+	then
 		local def = definition :: SequenceDef
 		local count = #def.children
 		local firstPos = #childrenData + 1
@@ -394,19 +477,27 @@ local function buildFlatTree(definition: NodeDefinition, nodes: { FlatNode }, ch
 			childrenData[firstPos + i - 1] = 0
 		end
 		for i, childDef in def.children do
-			childrenData[firstPos + i - 1] = buildFlatTree(childDef, nodes, childrenData)
+			childrenData[firstPos + i - 1] = buildFlatTree(childDef, nodes, childrenData, varsStack)
 		end
 	elseif nodeType == "invert" or nodeType == "repeat" or nodeType == "retry" then
 		local def = definition :: InvertDef
-		node.child = buildFlatTree(def.child, nodes, childrenData)
+		node.child = buildFlatTree(def.child, nodes, childrenData, varsStack)
 	elseif nodeType == "alwaysSucceed" or nodeType == "alwaysFail" then
 		local def = definition :: AlwaysSucceedDef
 		if def.child then
-			node.child = buildFlatTree(def.child, nodes, childrenData)
+			node.child = buildFlatTree(def.child, nodes, childrenData, varsStack)
 		end
 	elseif nodeType == "subtree" then
 		local def = definition :: SubtreeDef
-		node.child = buildFlatTree(def.module, nodes, childrenData)
+		local pushed = false
+		if def.vars ~= nil then
+			table.insert(varsStack, def.vars)
+			pushed = true
+		end
+		node.child = buildFlatTree(def.module, nodes, childrenData, varsStack)
+		if pushed then
+			table.remove(varsStack)
+		end
 	end
 
 	return nodeIndex
@@ -430,7 +521,7 @@ end
 
 local function getTaskResolvedParams(node: FlatNode, def: TaskDef, blackboard: Blackboard): { [string]: any }
 	if node.resolvedParams == nil then
-		node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard)
+		node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard, node.varScope)
 	end
 	return node.resolvedParams
 end
@@ -502,7 +593,7 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 
 	if not node.activeThisTick then
 		if not node.wasRunning then
-			node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard)
+			node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard, node.varScope)
 		end
 		taskParams = getTaskResolvedParams(node, def, blackboard)
 
@@ -919,7 +1010,7 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 	if not cached then
 		local templateNodes: { FlatNode } = {}
 		local childrenData: { number } = {}
-		local rootIndex = buildFlatTree(definition, templateNodes, childrenData)
+		local rootIndex = buildFlatTree(definition, templateNodes, childrenData, {})
 		local nodeTemplates: { NodeTemplate } = {}
 		for i, node in templateNodes do
 			nodeTemplates[i] = {
@@ -928,6 +1019,7 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 				firstChild = node.firstChild,
 				childCount = node.childCount,
 				child = node.child,
+				varScope = node.varScope,
 			}
 		end
 		cached = { childrenData = childrenData, nodeTemplates = nodeTemplates, rootIndex = rootIndex }
@@ -952,6 +1044,7 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			activeThisTick = false,
 			wasRunning = false,
 			resolvedParams = nil,
+			varScope = template.varScope,
 		}
 	end
 
@@ -1080,12 +1173,13 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			end
 
 			if isDebug then
-				return status, {
-					tick = tickCount,
-					paused = false,
-					nodeStates = buildNodeStates(nodes),
-					taskParams = buildDebugTaskParams(nodes),
-				}
+				return status,
+					{
+						tick = tickCount,
+						paused = false,
+						nodeStates = buildNodeStates(nodes),
+						taskParams = buildDebugTaskParams(nodes),
+					}
 			end
 
 			return status
@@ -1158,6 +1252,24 @@ function BehaviorTree.calc(resolver: (blackboard: Blackboard) -> any): ParamCalc
 	return {
 		__btParamKind = PARAM_CALC_KIND,
 		resolver = resolver,
+	}
+end
+
+-- References a tree var supplied by an enclosing BT.subtree node's `vars` table.
+-- Resolved once per task activation (same lifecycle as BT.bind/BT.calc): the nearest
+-- enclosing subtree node that supplies the var wins; if none supplies it, `default`
+-- is used (which may itself be a BT.bind, BT.calc, or another BT.var).
+function BehaviorTree.var(name: string, default: any?): ParamVar
+	if type(name) ~= "string" or name == "" then
+		error("BT.var name must be a non-empty string", 2)
+	end
+	if type(default) == "function" then
+		error("BT.var default: function values must be wrapped in BT.calc(...)", 2)
+	end
+	return {
+		__btParamKind = PARAM_VAR_KIND,
+		name = name,
+		default = default,
 	}
 end
 
@@ -1235,8 +1347,24 @@ end
 -- Inlines a subtree from a required module into this tree at build time.
 -- The subtree node is a pass-through at runtime but is preserved in debug snapshots so
 -- a visual editor can identify the subtree boundary.
-function BehaviorTree.subtree(module: NodeDefinition, meta: NodeMeta?): SubtreeDef
-	return { _type = "subtree", module = module, meta = meta }
+-- `vars` supplies values for BT.var(...) references used by tasks inside the subtree.
+-- Entries may be literals, BT.bind(...), BT.calc(...), or BT.var(...) — the last of which
+-- re-exposes the var to this subtree's own enclosing scope, so subtrees nest cleanly.
+function BehaviorTree.subtree(module: NodeDefinition, vars: { [string]: any }?, meta: NodeMeta?): SubtreeDef
+	if vars ~= nil then
+		if type(vars) ~= "table" then
+			error("BT.subtree vars must be a table or nil", 2)
+		end
+		for name, value in vars do
+			if type(value) == "function" then
+				error(
+					string.format("subtree var '%s': function values must be wrapped in BT.calc(...)", tostring(name)),
+					2
+				)
+			end
+		end
+	end
+	return { _type = "subtree", module = module, vars = vars, meta = meta }
 end
 
 -- Randomly picks one child to execute per activation. weights must be the same length as children
@@ -1263,6 +1391,7 @@ export type Library = {
 	new: (definition: NodeDefinition, blackboard: Blackboard, debug: (boolean | string)?) -> Tree,
 	bind: (path: string) -> ParamBinding,
 	calc: (resolver: (blackboard: Blackboard) -> any) -> ParamCalculation,
+	var: (name: string, default: any?) -> ParamVar,
 	task: (module: BTreeTask, params: any?, meta: NodeMeta?) -> TaskDef,
 	condition: (check: (blackboard: Blackboard) -> boolean, meta: NodeMeta?) -> ConditionDef,
 	sequence: (children: { NodeDefinition }, meta: NodeMeta?) -> SequenceDef,
@@ -1278,7 +1407,7 @@ export type Library = {
 	alwaysFail: (child: NodeDefinition?, meta: NodeMeta?) -> AlwaysFailDef,
 	repeatNode: (child: NodeDefinition, times: number, meta: NodeMeta?) -> RepeatDef,
 	retryNode: (child: NodeDefinition, times: number, meta: NodeMeta?) -> RetryDef,
-	subtree: (module: NodeDefinition, meta: NodeMeta?) -> SubtreeDef,
+	subtree: (module: NodeDefinition, vars: { [string]: any }?, meta: NodeMeta?) -> SubtreeDef,
 	randomSelector: (children: { NodeDefinition }, weights: { number }?, meta: NodeMeta?) -> RandomSelectorDef,
 }
 

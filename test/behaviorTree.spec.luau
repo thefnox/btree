@@ -657,6 +657,159 @@ return function(tiniest: tiniest_actual)
 	end)
 
 	------------------------------------------------------------------------
+	-- tree vars
+	------------------------------------------------------------------------
+
+	describe("tree vars", function()
+		local function paramCapture(store: { any })
+			return {
+				run = function(_bb: BT.Blackboard, params: any)
+					table.insert(store, params)
+					return SUCCESS
+				end,
+			}
+		end
+
+		test("BT.var resolves from the enclosing subtree's vars", function()
+			local captured: { any } = {}
+			local inner = BT.task(paramCapture(captured), { speed = BT.var("speed") })
+			local def = BT.subtree(inner, { speed = 42 })
+			expect(BT.new(def, {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(42)
+		end)
+
+		test("BT.var falls back to its default when the var is not supplied", function()
+			local captured: { any } = {}
+			local inner = BT.task(paramCapture(captured), { speed = BT.var("speed", 7) })
+			local def = BT.subtree(inner)
+			expect(BT.new(def, {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(7)
+		end)
+
+		test("BT.var resolves to nil without a supply or default", function()
+			local captured: { any } = {}
+			local inner = BT.task(paramCapture(captured), { speed = BT.var("speed") })
+			expect(BT.new(BT.subtree(inner), {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(nil)
+		end)
+
+		test("BT.var works outside any subtree, using its default", function()
+			local captured: { any } = {}
+			local def = BT.task(paramCapture(captured), { speed = BT.var("speed", 3) })
+			expect(BT.new(def, {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(3)
+		end)
+
+		test("nearest enclosing subtree supply wins in nested subtrees", function()
+			local captured: { any } = {}
+			local innerTask = BT.task(paramCapture(captured), { speed = BT.var("speed", 1) })
+			local innerSubtree = BT.subtree(innerTask, { speed = 2 })
+			local outerSubtree = BT.subtree(innerSubtree, { speed = 3 })
+			expect(BT.new(outerSubtree, {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(2)
+		end)
+
+		test("a subtree var can re-expose a var from its outer scope", function()
+			local captured: { any } = {}
+			local innerTask = BT.task(paramCapture(captured), { speed = BT.var("speed") })
+			-- Inner subtree forwards its `speed` var from the outer scope's `groupSpeed`.
+			local innerSubtree = BT.subtree(innerTask, { speed = BT.var("groupSpeed", 5) })
+			local outerSubtree = BT.subtree(innerSubtree, { groupSpeed = 11 })
+			expect(BT.new(outerSubtree, {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(11)
+		end)
+
+		test("re-exposed var falls back to its own default when the outer scope has no supply", function()
+			local captured: { any } = {}
+			local innerTask = BT.task(paramCapture(captured), { speed = BT.var("speed") })
+			local innerSubtree = BT.subtree(innerTask, { speed = BT.var("groupSpeed", 5) })
+			expect(BT.new(BT.subtree(innerSubtree), {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(5)
+		end)
+
+		test("subtree vars may be BT.bind and BT.calc values resolved against the blackboard", function()
+			local captured: { any } = {}
+			local innerTask = BT.task(paramCapture(captured), {
+				target = BT.var("target"),
+				double = BT.var("double"),
+			})
+			local def = BT.subtree(innerTask, {
+				target = BT.bind("squad.leader"),
+				double = BT.calc(function(bb: BT.Blackboard)
+					return (bb :: any).speed * 2
+				end),
+			})
+			local bb = { squad = { leader = "alpha" }, speed = 6 }
+			expect(BT.new(def, bb):update()).is(SUCCESS)
+			expect(captured[1].target).is("alpha")
+			expect(captured[1].double).is(12)
+		end)
+
+		test("BT.var default may be a BT.bind resolved against the blackboard", function()
+			local captured: { any } = {}
+			local inner = BT.task(paramCapture(captured), { speed = BT.var("speed", BT.bind("defaultSpeed")) })
+			expect(BT.new(BT.subtree(inner), { defaultSpeed = 9 }):update()).is(SUCCESS)
+			expect(captured[1].speed).is(9)
+		end)
+
+		test("the same subtree definition can be included twice with different vars", function()
+			local captured: { any } = {}
+			local shared = BT.task(paramCapture(captured), { speed = BT.var("speed") })
+			local def = BT.sequence({
+				BT.subtree(shared, { speed = 1 }),
+				BT.subtree(shared, { speed = 2 }),
+			})
+			expect(BT.new(def, {}):update()).is(SUCCESS)
+			expect(captured[1].speed).is(1)
+			expect(captured[2].speed).is(2)
+		end)
+
+		test("vars re-resolve when a task starts a new activation", function()
+			local captured: { any } = {}
+			local supplied = { speed = BT.bind("speed") }
+			local inner = BT.task(paramCapture(captured), { speed = BT.var("speed") })
+			local def = BT.subtree(inner, supplied)
+			local bb: { [any]: any } = { speed = 1 }
+			local tree = BT.new(def, bb)
+			tree:update()
+			bb.speed = 2
+			tree:update()
+			expect(captured[1].speed).is(1)
+			expect(captured[2].speed).is(2)
+		end)
+
+		test("BT.var rejects invalid names and function defaults", function()
+			expect(function()
+				BT.var("")
+			end).fails_with("BT.var name")
+			expect(function()
+				BT.var("speed", function() end)
+			end).fails_with("BT.calc")
+		end)
+
+		test("subtree vars reject bare function values", function()
+			expect(function()
+				BT.subtree(BT.task(SUCCEED), { speed = function() end })
+			end).fails_with("BT.calc")
+		end)
+
+		test("cyclic var defaults error instead of hanging", function()
+			local inner = BT.task(SUCCEED, { speed = BT.var("speed", BT.var("speed", BT.var("speed"))) })
+			-- Build a deliberately self-referential default chain via table mutation.
+			local a: any = BT.var("a")
+			local b: any = BT.var("b")
+			a.default = b
+			b.default = a
+			local cyclic = BT.task(SUCCEED, { value = a })
+			expect(function()
+				BT.new(BT.subtree(cyclic), {}):update()
+			end).fails_with("max depth")
+			-- A merely deep (non-cyclic) chain still resolves fine.
+			expect(BT.new(BT.subtree(inner), {}):update()).is(SUCCESS)
+		end)
+	end)
+
+	------------------------------------------------------------------------
 	-- randomSelector
 	------------------------------------------------------------------------
 
@@ -939,19 +1092,22 @@ return function(tiniest: tiniest_actual)
 			expect(frame.nodeStates[4]).is(SUCCESS)
 		end)
 
-		test("captures each completion when a selector falls through multiple failing children before succeeding", function()
-			-- Selector(1) -> task FAIL (2), task FAIL (3), task SUCCEED (4).
-			-- All three children are visited in a single tick; their
-			-- terminal statuses must all be present alongside the selector's
-			-- SUCCESS.
-			local tree = BT.new(BT.selector({ BT.task(FAIL), BT.task(FAIL), BT.task(SUCCEED) }), {}, true)
-			local frame = tickWithTrace(tree)
-			expect(frame.status).is(SUCCESS)
-			expect(frame.nodeStates[1]).is(SUCCESS)
-			expect(frame.nodeStates[2]).is(FAILURE)
-			expect(frame.nodeStates[3]).is(FAILURE)
-			expect(frame.nodeStates[4]).is(SUCCESS)
-		end)
+		test(
+			"captures each completion when a selector falls through multiple failing children before succeeding",
+			function()
+				-- Selector(1) -> task FAIL (2), task FAIL (3), task SUCCEED (4).
+				-- All three children are visited in a single tick; their
+				-- terminal statuses must all be present alongside the selector's
+				-- SUCCESS.
+				local tree = BT.new(BT.selector({ BT.task(FAIL), BT.task(FAIL), BT.task(SUCCEED) }), {}, true)
+				local frame = tickWithTrace(tree)
+				expect(frame.status).is(SUCCESS)
+				expect(frame.nodeStates[1]).is(SUCCESS)
+				expect(frame.nodeStates[2]).is(FAILURE)
+				expect(frame.nodeStates[3]).is(FAILURE)
+				expect(frame.nodeStates[4]).is(SUCCESS)
+			end
+		)
 
 		test("does not include nodes that were short-circuited away in a sequence", function()
 			-- Sequence(1) -> task FAIL (2), task SUCCEED (3). Node 3 must not
@@ -1330,11 +1486,14 @@ return function(tiniest: tiniest_actual)
 		end)
 
 		test("preserves pause state", function()
-			local tree = BT.new(BT.task({
-				run = function()
-					return RUNNING
-				end,
-			}), {})
+			local tree = BT.new(
+				BT.task({
+					run = function()
+						return RUNNING
+					end,
+				}),
+				{}
+			)
 
 			tree:update()
 			tree:pause()

@@ -36,6 +36,7 @@ export type ParamTypes = nativeBT.ParamTypes
 export type ParamPathSegment = nativeBT.ParamPathSegment
 export type ParamBinding = nativeBT.ParamBinding
 export type ParamCalculation = nativeBT.ParamCalculation
+export type ParamVar = nativeBT.ParamVar
 export type Task = nativeBT.BTreeTask
 export type TaskDef = nativeBT.TaskDef
 export type ConditionDef = nativeBT.ConditionDef
