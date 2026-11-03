@@ -210,7 +210,16 @@ tree:destroy()          -- fire onExit for active tasks and tear down; safe to c
 
 ## Debug mode
 
-Pass a third argument to `BT.new` to enable debug mode. This makes `update()` return a `DebugSnapshot` as a second value and fires a `BTDebugSnapshot` BindableEvent that the BTree Studio plugin listens to.
+Pass a third argument to `BT.new` to enable debug mode. This registers the tree with the remote debugger (see [Remote debugging](#remote-debugging)) so the BTree Studio plugin can find, subscribe to and pause it.
+
+A debug tree only does debug work while something observes it: a remote subscriber, or the in-process `BTDebugSnapshot` BindableEvent once a listener sets its `Enabled` attribute to `true`. While observed, `update()` returns a `DebugSnapshot` as a second value and the wrapper serializes the blackboard for each observer. While unobserved, it ticks like a non-debug tree: no snapshot, no trace and no blackboard serialization, so leaving debug on for every tree in a development build costs almost nothing until a tree is opened in the debugger.
+
+```lua
+-- Opt in to the legacy in-process event before connecting to it.
+local snapshotEvent = BTreeLibrary:FindFirstChild("BTDebugSnapshot") :: BindableEvent
+snapshotEvent:SetAttribute("Enabled", true)
+snapshotEvent.Event:Connect(function(definitionPath, debugName, snapshot) end)
+```
 
 ```lua
 -- Pass true to enable (definition path defaults to "")
@@ -236,7 +245,7 @@ type DebugSnapshot = {
 }
 ```
 
-Debug mode adds no overhead when disabled (`false` / `nil`).
+Debug mode adds no overhead when disabled (`false` / `nil`), and next to none while a debug tree is unobserved. Calling the native library directly (without the Roblox wrapper) keeps the snapshot on every update.
 
 ## Task params
 
@@ -292,7 +301,7 @@ In addition to the in-process `BTDebugSnapshot` BindableEvent, the server expose
 | `DebugSnapshot` | Server → Client | Buffer: `u8 kind` (0=full, 1=delta), `u32 treeId`, `u32 tick`, `u8 paused`, node-state entries, task-param trace entries, then blackboard entries. |
 | `DebugOpenRequest` | Server → Client | Buffer: `u32 treeId`. Fired by the server (via `BT.openDebugViewer`) to a single targeted player so their Studio plugin can focus the matching tree's debug widget. |
 
-The first snapshot a subscriber receives is a full packet containing the last completed update trace for the tree and the complete serialized blackboard. Each subsequent packet sends the full visited-node trace for that update again, plus the resolved task params for the task nodes that executed in that update, while only the blackboard portion is delta-compressed (`blackboardSet` / `blackboardRemoved`).
+The first snapshot a subscriber receives is a full packet containing an update trace for the tree and the complete serialized blackboard. If another subscriber is already watching, it is the last completed update's trace, sent immediately; otherwise it is sent with the tree's next update, since an unobserved tree keeps no trace. Each subsequent packet sends the full visited-node trace for that update again, plus the resolved task params for the task nodes that executed in that update, while only the blackboard portion is delta-compressed (`blackboardSet` / `blackboardRemoved`).
 
 `nodeStates` contains the final status of every node that was visited during the last completed `tree:update()`. Nodes that were not visited in that update are omitted entirely.
 

@@ -73,6 +73,10 @@ type TreeEntry = {
 	currentTick: number,
 	currentPaused: boolean,
 	setPaused: (paused: boolean) -> (),
+	-- Told when the first subscriber arrives and when the last one leaves, so the wrapper only
+	-- traces and serializes trees someone is watching.
+	setObserved: ((observed: boolean) -> ())?,
+	observed: boolean,
 	subscribers: { [Player]: SubscriberState },
 }
 
@@ -112,6 +116,24 @@ local function frameFromEntry(entry: TreeEntry): debugCodec.SnapshotFrame
 		taskParams = entry.currentTraceTaskParams or {},
 		blackboard = entry.currentBlackboard or {},
 	}
+end
+
+-- A tree that loses its last subscriber drops its cached trace, so a later subscriber is never
+-- sent a stale one; its first snapshot arrives with the tree's next observed update instead.
+local function refreshObserved(entry: TreeEntry)
+	local observed = next(entry.subscribers) ~= nil
+	if observed == entry.observed then
+		return
+	end
+	entry.observed = observed
+	if not observed then
+		entry.currentBlackboard = nil
+		entry.currentTraceNodeStates = nil
+		entry.currentTraceTaskParams = nil
+	end
+	if entry.setObserved then
+		entry.setObserved(observed)
+	end
 end
 
 local function broadcastSnapshot(entry: TreeEntry)
@@ -227,6 +249,7 @@ local function ensureRemotes()
 		else
 			entry.subscribers[player] = nil
 		end
+		refreshObserved(entry)
 	end)
 
 	pause.OnServerEvent:Connect(function(_player, payload)
@@ -250,18 +273,23 @@ local function ensureRemotes()
 	-- references or try to send to a gone player.
 	Players.PlayerRemoving:Connect(function(player)
 		for _, entry in trees do
-			entry.subscribers[player] = nil
+			if entry.subscribers[player] ~= nil then
+				entry.subscribers[player] = nil
+				refreshObserved(entry)
+			end
 		end
 	end)
 end
 
 -- Registers a new debug tree. Returns the assigned id. Server-only; on the
--- client this is a no-op returning 0.
+-- client this is a no-op returning 0. `setObserved` is called with true when
+-- the tree gains its first subscriber and with false when it loses the last.
 function DebugNetwork.registerTree(
 	debugName: string,
 	definitionPath: string,
 	definition: any,
-	setPaused: (paused: boolean) -> ()
+	setPaused: (paused: boolean) -> (),
+	setObserved: ((observed: boolean) -> ())?
 ): number
 	if not IS_SERVER then
 		return 0
@@ -281,6 +309,8 @@ function DebugNetwork.registerTree(
 		currentTick = 0,
 		currentPaused = false,
 		setPaused = setPaused,
+		setObserved = setObserved,
+		observed = false,
 		subscribers = {},
 	}
 	return id
@@ -295,10 +325,20 @@ function DebugNetwork.unregisterTree(treeId: number)
 	trees[treeId] = nil
 end
 
--- Called by the wrapper after each tree:update(). `nodeStates` is the final
--- visited-node trace for the last completed update, `taskParams` carries the
--- resolved params for the task nodes visited in that same update, and
--- `blackboard` is the raw table (will be serialized here).
+-- Called by the wrapper after a tree:update() that nobody observed, so the tree
+-- list still reports how often the tree runs.
+function DebugNetwork.countExecution(treeId: number)
+	local entry = trees[treeId]
+	if entry then
+		entry.executionCount += 1
+	end
+end
+
+-- Called by the wrapper after each observed tree:update(). `nodeStates` is the
+-- final visited-node trace for the last completed update, `taskParams` carries
+-- the resolved params for the task nodes visited in that same update, and
+-- `blackboard` is the raw table, serialized here only while the tree has a
+-- subscriber.
 function DebugNetwork.onTreeUpdated(
 	treeId: number,
 	tick: number,
@@ -317,6 +357,9 @@ function DebugNetwork.onTreeUpdated(
 	entry.executionCount += 1
 	entry.currentTick = tick
 	entry.currentPaused = paused
+	if not entry.observed then
+		return
+	end
 	entry.currentTraceNodeStates = table.clone(nodeStates)
 	entry.currentTraceTaskParams = cloneTaskParamTrace(taskParams)
 	entry.currentBlackboard = serializeBlackboard(blackboard)

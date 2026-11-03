@@ -35,7 +35,7 @@ local function newSignal()
 	return signal
 end
 
-local function loadDebugNetwork()
+local function loadDebugNetwork(serializeOverride: ((blackboard: any) -> any)?)
 	local instances = {}
 	local parentInstance = {}
 
@@ -80,7 +80,7 @@ local function loadDebugNetwork()
 
 	local function injectedRequire(path: string)
 		if path == "./serializeBlackboard" then
-			return require("../lib/behaviorTree/serializeBlackboard")
+			return serializeOverride or require("../lib/behaviorTree/serializeBlackboard")
 		end
 		if path == "./debugCodec" then
 			return debugCodec
@@ -99,7 +99,60 @@ local function loadDebugNetwork()
 		return parentInstance:FindFirstChild(name)
 	end
 
-	return network, getRemote
+	return network, getRemote, playerRemoving
+end
+
+-- Loads the Roblox wrapper over the real native library with a stub debug registry,
+-- a counting serializer and an optional legacy BTDebugSnapshot event.
+local function loadWrapper(debugNetwork: any, serialize: (blackboard: any) -> any, legacyEvent: any?): any
+	local nativeBT = require("../lib/behaviorTree/behaviorTree")
+	local function injectedRequire(path: string)
+		if path == "@self/behaviorTree" then
+			return nativeBT
+		end
+		if path == "@self/serializeBlackboard" then
+			return serialize
+		end
+		if path == "@self/debugNetwork" then
+			return debugNetwork
+		end
+		error("Unexpected require: " .. path)
+	end
+	return loadWithEnvironment("lib/behaviorTree/init.lua", {
+		game = {
+			GetService = function()
+				return {
+					AddTag = function() end,
+					RemoveTag = function() end,
+				}
+			end,
+		},
+		require = injectedRequire,
+		script = {
+			FindFirstChild = function(_self, name)
+				return if name == "BTDebugSnapshot" then legacyEvent else nil
+			end,
+		},
+	})
+end
+
+local function newLegacyEvent()
+	local attributeChanged = newSignal()
+	local legacyEvent = { attributes = {}, fired = 0 }
+	function legacyEvent:GetAttribute(name)
+		return self.attributes[name]
+	end
+	function legacyEvent:SetAttribute(name, value)
+		self.attributes[name] = value
+		attributeChanged:Fire()
+	end
+	function legacyEvent:GetAttributeChangedSignal()
+		return attributeChanged
+	end
+	function legacyEvent:Fire()
+		self.fired += 1
+	end
+	return legacyEvent
 end
 
 local function forceAutomaticCollection()
@@ -284,7 +337,8 @@ return function(tiniest: tiniest_actual)
 				}
 			end
 			local debugNetwork = {
-				registerTree = function()
+				registerTree = function(_debugName, _definitionPath, _definition, _setPaused, setObserved)
+					setObserved(true)
 					return 7
 				end,
 				unregisterTree = function(treeId)
@@ -294,6 +348,7 @@ return function(tiniest: tiniest_actual)
 				onTreeUpdated = function()
 					updatedCalls += 1
 				end,
+				countExecution = function() end,
 				requestOpenViewer = function() end,
 			}
 			local function injectedRequire(path: string)
@@ -503,6 +558,172 @@ return function(tiniest: tiniest_actual)
 			forceAutomaticCollection()
 
 			expect(weakTargets[1]).is(nil)
+		end)
+	end)
+
+	describe("debug observation gating", function()
+		local function countingTask(): any
+			local nativeBT = require("../lib/behaviorTree/behaviorTree")
+			return nativeBT.task({
+				run = function()
+					return nativeBT.SUCCESS
+				end,
+			})
+		end
+
+		test("a native debug tree with snapshots disabled skips the snapshot and callback", function()
+			local nativeBT = require("../lib/behaviorTree/behaviorTree")
+			local tree: any = nativeBT.new(countingTask(), {}, true)
+			local callbacks = 0
+			local function onNode()
+				callbacks += 1
+			end
+
+			tree._debugSetSnapshotsEnabled(false)
+			local status, snapshot = tree:update(onNode)
+			expect(status).is(nativeBT.SUCCESS)
+			expect(snapshot).is(nil)
+			expect(callbacks).is(0)
+
+			tree:pause()
+			local _, pausedSnapshot = tree:update(onNode)
+			expect(pausedSnapshot).is(nil)
+			tree:resume()
+
+			tree._debugSetSnapshotsEnabled(true)
+			local _, enabledSnapshot = tree:update(onNode)
+			expect(enabledSnapshot ~= nil).is(true)
+			expect(callbacks > 0).is(true)
+		end)
+
+		test("the wrapper only serializes and forwards while the registry reports an observer", function()
+			local setObserved: ((boolean) -> ())? = nil
+			local forwarded = 0
+			local counted = 0
+			local debugNetwork = {
+				registerTree = function(_debugName, _definitionPath, _definition, _setPaused, observedSetter)
+					setObserved = observedSetter
+					return 3
+				end,
+				unregisterTree = function() end,
+				onTreeUpdated = function(_treeId, _tick, _paused, _nodeStates, _taskParams, blackboard)
+					expect(blackboard.hp).is(10)
+					forwarded += 1
+				end,
+				countExecution = function(treeId)
+					expect(treeId).is(3)
+					counted += 1
+				end,
+				requestOpenViewer = function() end,
+			}
+			local serialized = 0
+			local wrapper = loadWrapper(debugNetwork, function(blackboard)
+				serialized += 1
+				return blackboard
+			end)
+			local tree = wrapper.new(countingTask(), { hp = 10 }, true)
+
+			local _, unobservedSnapshot = tree:update()
+			tree:update()
+			expect(unobservedSnapshot).is(nil)
+			expect(forwarded).is(0)
+			expect(counted).is(2)
+
+			local observedSetter = setObserved :: (boolean) -> ()
+			observedSetter(true)
+			local _, observedSnapshot = tree:update()
+			expect(observedSnapshot ~= nil).is(true)
+			expect(forwarded).is(1)
+			expect(counted).is(2)
+
+			observedSetter(false)
+			tree:update()
+			expect(forwarded).is(1)
+			expect(counted).is(3)
+			expect(serialized).is(0)
+		end)
+
+		test("the legacy event fires only while its Enabled attribute is set", function()
+			local debugNetwork = {
+				registerTree = function()
+					return 4
+				end,
+				unregisterTree = function() end,
+				onTreeUpdated = function()
+					error("an unsubscribed tree must not be forwarded")
+				end,
+				countExecution = function() end,
+				requestOpenViewer = function() end,
+			}
+			local serialized = 0
+			local legacyEvent = newLegacyEvent()
+			local wrapper = loadWrapper(debugNetwork, function(blackboard)
+				serialized += 1
+				return blackboard
+			end, legacyEvent)
+			local tree = wrapper.new(countingTask(), {}, true)
+
+			tree:update()
+			expect(legacyEvent.fired).is(0)
+			expect(serialized).is(0)
+
+			legacyEvent:SetAttribute("Enabled", true)
+			tree:update()
+			expect(legacyEvent.fired).is(1)
+			expect(serialized).is(1)
+
+			legacyEvent:SetAttribute("Enabled", false)
+			tree:update()
+			expect(legacyEvent.fired).is(1)
+			expect(serialized).is(1)
+		end)
+
+		test("the registry serializes only subscribed trees and drops the trace when the last one leaves", function()
+			local serialized = 0
+			local network, getRemote, playerRemoving = loadDebugNetwork(function(blackboard)
+				serialized += 1
+				return blackboard
+			end)
+			local observedValues = {}
+			local treeId = network.registerTree("guard", "Server.GuardTree", {
+				_type = "condition",
+				check = function()
+					return true
+				end,
+			}, function() end, function(observed)
+				table.insert(observedValues, observed)
+			end)
+			local subscribe = getRemote("DebugSubscribe")
+			local snapshot = getRemote("DebugSnapshot")
+			local player = {}
+
+			network.onTreeUpdated(treeId, 1, false, { [1] = 0 }, {}, { hp = 100 })
+			expect(serialized).is(0)
+			expect(#snapshot.fired).is(0)
+
+			subscribe.OnServerEvent:Fire(player, debugCodec.encodeSubscribe(treeId, true))
+			expect(observedValues[1]).is(true)
+			network.onTreeUpdated(treeId, 2, false, { [1] = 0 }, {}, { hp = 90 })
+			expect(serialized).is(1)
+			expect(#snapshot.fired).is(1)
+			expect(debugCodec.decodeSnapshot(snapshot.fired[1].payload).tick).is(2)
+
+			subscribe.OnServerEvent:Fire(player, debugCodec.encodeSubscribe(treeId, false))
+			expect(observedValues[2]).is(false)
+			network.onTreeUpdated(treeId, 3, false, { [1] = 0 }, {}, { hp = 80 })
+			expect(serialized).is(1)
+
+			-- The cached trace was dropped, so a returning subscriber waits for the next update
+			-- rather than receiving the stale one.
+			subscribe.OnServerEvent:Fire(player, debugCodec.encodeSubscribe(treeId, true))
+			expect(#snapshot.fired).is(1)
+			network.onTreeUpdated(treeId, 4, false, { [1] = 0 }, {}, { hp = 70 })
+			expect(#snapshot.fired).is(2)
+			expect(debugCodec.decodeSnapshot(snapshot.fired[2].payload).tick).is(4)
+
+			playerRemoving:Fire(player)
+			expect(observedValues[#observedValues]).is(false)
+			expect(#observedValues).is(4)
 		end)
 	end)
 end

@@ -200,6 +200,7 @@ export type Tree = {
 	isPaused: (self: Tree) -> boolean,
 	destroy: (self: Tree) -> (),
 	_debugSetPaused: (paused: boolean) -> (),
+	_debugSetSnapshotsEnabled: (enabled: boolean) -> (),
 	_debugId: number?,
 }
 
@@ -1069,8 +1070,12 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 	local paused = false
 	local lastStatus: Status = RUNNING
 	local isDebug = debug and true or false
+	local snapshotsEnabled = true
 	local function setPaused(value: boolean)
 		paused = value
+	end
+	local function setSnapshotsEnabled(value: boolean)
+		snapshotsEnabled = value
 	end
 
 	local function resetTreeRuntime(resumeAfterReset: boolean)
@@ -1105,8 +1110,9 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 		-- and after each node is ticked with `(nodeIndex, status)`. Before entry the status
 		-- is RUNNING; after the ticker completes it is the result status.
 		update = function(_self: Tree, debugCallback: DebugCallback?): (Status, DebugSnapshot?)
+			local tracing = isDebug and snapshotsEnabled
 			if paused then
-				if isDebug then
+				if tracing then
 					local snapshot = {
 						tick = tickCount,
 						paused = true,
@@ -1124,8 +1130,8 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			if ctx then
 				table.clear(ctx.leaveProcessed)
 				-- Store the callback so tickNode can invoke it around each node.
-				-- Only set when debug is enabled; otherwise the callback is ignored.
-				if isDebug then
+				-- Only set while debug snapshots are enabled; otherwise the callback is ignored.
+				if tracing then
 					ctx.debugCallback = debugCallback
 				end
 			end
@@ -1172,7 +1178,7 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 				ctx.debugCallback = nil
 			end
 
-			if isDebug then
+			if tracing then
 				return status,
 					{
 						tick = tickCount,
@@ -1227,6 +1233,10 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 		-- Internal pause control for the Roblox debug registry. This closure only
 		-- captures the paused scalar, never the tree table or its runtime arrays.
 		_debugSetPaused = setPaused,
+
+		-- Internal switch for the Roblox wrapper, which turns debug snapshots off while nobody
+		-- is observing the tree. A debug tree with snapshots off ticks like a non-debug tree.
+		_debugSetSnapshotsEnabled = setSnapshotsEnabled,
 	}
 
 	return tree

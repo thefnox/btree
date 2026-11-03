@@ -2,13 +2,14 @@
 -- Handles BindableEvent communication so the plugin can receive debug snapshots
 -- without the native library depending on any Roblox APIs.
 --
--- When a tree is created with debug enabled, each tree:update() call passes a
--- debugCallback to the native update function. The native library calls this
--- callback before and after each node is ticked with (nodeIndex, status).
--- The wrapper accumulates these per-node updates into the last completed
--- visited-node trace for that frame and fires the BTDebugSnapshot
--- BindableEvent. The payload also includes resolved task params for the task
--- nodes that executed in that last completed update.
+-- When a tree is created with debug enabled and something observes it (a remote
+-- subscriber, or the BTDebugSnapshot event with its `Enabled` attribute set),
+-- each tree:update() call passes a debugCallback to the native update function.
+-- The native library calls this callback before and after each node is ticked
+-- with (nodeIndex, status). The wrapper accumulates these per-node updates into
+-- the last completed visited-node trace for that frame and publishes it with the
+-- serialized blackboard and the resolved task params for the task nodes that
+-- executed in that update. An unobserved debug tree ticks like a non-debug tree.
 --
 -- The `debug` parameter to BT.new can be:
 --   false / nil  — no debugging
@@ -66,6 +67,17 @@ export type Library = nativeBT.Library & {
 
 local event = script:FindFirstChild("BTDebugSnapshot")
 
+-- The in-process event carries a fully serialized blackboard, and a BindableEvent cannot report
+-- whether anything is connected to it, so it only fires once a listener sets this attribute.
+local LEGACY_EVENT_ENABLED_ATTRIBUTE = "Enabled"
+local legacyEventEnabled = false
+if event then
+	legacyEventEnabled = event:GetAttribute(LEGACY_EVENT_ENABLED_ATTRIBUTE) == true
+	event:GetAttributeChangedSignal(LEGACY_EVENT_ENABLED_ATTRIBUTE):Connect(function()
+		legacyEventEnabled = event:GetAttribute(LEGACY_EVENT_ENABLED_ATTRIBUTE) == true
+	end)
+end
+
 local DEBUG_TARGET_TAG = "BehaviorTreeDebugTarget"
 local DEBUG_TREE_ID_ATTRIBUTE = "BehaviorTreeDebugTreeId"
 
@@ -111,7 +123,13 @@ function Wrapper.new(
 		-- subscribe to this tree. Server-only; returns 0 on the client.
 		-- The definition is stored so clients can request its static structure
 		-- over the DebugTreeDefinition RemoteEvent.
-		local treeId: number = debugNetwork.registerTree(debugName, definitionPath, definition, tree._debugSetPaused)
+		-- The registry reports when the first remote subscriber arrives and the last one leaves.
+		local remoteObserved = false
+		local function setRemoteObserved(observed: boolean)
+			remoteObserved = observed
+		end
+		local treeId: number =
+			debugNetwork.registerTree(debugName, definitionPath, definition, tree._debugSetPaused, setRemoteObserved)
 		-- Surface the registered id so BT.openDebugViewer can target this
 		-- tree. 0 means debug disabled / called on client.
 		tree._debugId = treeId
@@ -122,13 +140,33 @@ function Wrapper.new(
 		end
 
 		local nativeUpdate = tree.update
+		local setSnapshotsEnabled = tree._debugSetSnapshotsEnabled
 		local debugDisposed = false
+		local wasObserved = false
 		local lastRemoteNodeStates = {}
 		local lastRemoteTaskParams = {}
 		tree.update = function(self)
 			if debugDisposed then
 				return nativeUpdate(self)
 			end
+			-- Snapshots, traces and blackboard serialization only run while something observes this
+			-- tree. Unobserved, it ticks like a non-debug tree and returns no snapshot.
+			local observed = remoteObserved or legacyEventEnabled
+			if setSnapshotsEnabled then
+				setSnapshotsEnabled(observed)
+			end
+			if not observed then
+				if wasObserved then
+					wasObserved = false
+					lastRemoteNodeStates = {}
+					lastRemoteTaskParams = {}
+				end
+				if treeId ~= 0 then
+					debugNetwork.countExecution(treeId)
+				end
+				return nativeUpdate(self)
+			end
+			wasObserved = true
 			local nodeStates = {}
 			local function onNodeUpdate(nodeIndex, status)
 				nodeStates[nodeIndex] = status
@@ -150,7 +188,7 @@ function Wrapper.new(
 			if not isPaused then
 				emittedTaskParams = if nativeSnapshot then nativeSnapshot.taskParams else {}
 			end
-			if event and (next(nodeStates) or isPaused) then
+			if legacyEventEnabled and event and (next(nodeStates) or isPaused) then
 				event:Fire(definitionPath, debugName, {
 					tick = if nativeSnapshot then nativeSnapshot.tick else nil,
 					paused = isPaused,
@@ -162,7 +200,7 @@ function Wrapper.new(
 			-- Forward the visited-node execution trace to the remote debugger.
 			-- Unlike the native snapshot, this preserves the final status of
 			-- every node actually visited during the last completed update.
-			if treeId ~= 0 and nativeSnapshot ~= nil then
+			if remoteObserved and treeId ~= 0 and nativeSnapshot ~= nil then
 				debugNetwork.onTreeUpdated(
 					treeId,
 					nativeSnapshot.tick,
@@ -183,6 +221,9 @@ function Wrapper.new(
 				return
 			end
 			debugDisposed = true
+			if setSnapshotsEnabled then
+				setSnapshotsEnabled(false)
+			end
 			if treeId ~= 0 then
 				debugNetwork.unregisterTree(treeId)
 				if target and target:GetAttribute(DEBUG_TREE_ID_ATTRIBUTE) == treeId then
