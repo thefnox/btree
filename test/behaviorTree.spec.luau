@@ -2418,6 +2418,83 @@ return function(tiniest: tiniest_actual)
 				"Patrol.enter,Investigate.enter,Patrol.exit,Attack.enter,Investigate.exit,Attack.exit,Patrol.enter"
 			)
 		end)
+
+		test("a task left earlier in a tick does not exit again when a parallel stops its branch", function()
+			local bb = { flag = true, siblingTicks = 0 }
+			local exits = 0
+			local def = BT.parallel({
+				BT.repeatNode(
+					BT.selector({
+						BT.sequence({
+							BT.condition(function()
+								return bb.flag
+							end),
+							BT.task({
+								onExit = function()
+									exits += 1
+								end,
+							}),
+						}),
+						BT.task({
+							run = function()
+								return RUNNING
+							end,
+						}),
+					}),
+					-1
+				),
+				BT.task({
+					run = function()
+						bb.siblingTicks += 1
+						return if bb.siblingTicks < 2 then RUNNING else FAILURE
+					end,
+				}),
+			}, "requireAll", "requireOne")
+			local tree = BT.new(def, bb)
+			tree:update() -- t1: the hooked task succeeds inside the repeat
+			bb.flag = false
+			tree:update() -- t2: the selector falls through (hooked task exits), then the sibling fails the parallel
+			expect(exits).is(1)
+		end)
+
+		test("trees sharing one blackboard track their own exits", function()
+			local bb = { flag = true }
+			local exitsA, exitsB = 0, 0
+			local function build(onExit: () -> ())
+				return BT.selector({
+					BT.sequence({
+						BT.condition(function()
+							return bb.flag
+						end),
+						BT.task({ onExit = onExit }),
+					}),
+					BT.task({
+						run = function()
+							return RUNNING
+						end,
+					}),
+				})
+			end
+			local treeA = BT.new(
+				build(function()
+					exitsA += 1
+				end),
+				bb
+			)
+			local treeB = BT.new(
+				build(function()
+					exitsB += 1
+				end),
+				bb
+			)
+			treeA:update()
+			treeB:update()
+			bb.flag = false
+			treeA:update()
+			treeB:update()
+			expect(exitsA).is(1)
+			expect(exitsB).is(1)
+		end)
 	end)
 
 	------------------------------------------------------------------------

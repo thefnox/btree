@@ -174,6 +174,9 @@ type FlatNode = {
 	wasRunning: boolean, -- task: did the previous execution of this node return RUNNING?
 	resolvedParams: { [string]: any }?, -- task: params resolved once for the current activation
 	varScope: { { [string]: any } }?, -- task: enclosing subtree vars tables, innermost first
+	staticParams: boolean, -- task: no param is a BT.bind/BT.calc/BT.var, so resolving is a shallow copy
+	hasEdgeHooks: boolean, -- whether this subtree contains a task with onEnter or onExit
+	ticker: Ticker,
 }
 
 -- Lightweight debug snapshot returned as the second value from tree:update()
@@ -204,23 +207,33 @@ export type Tree = {
 	_debugId: number?,
 }
 
--- Per-tree runtime context used during a tick to fire onExit callbacks inline,
--- before the next task runs, rather than at the end of the whole tick.
+-- Per-tree runtime context passed through every ticker. Only the task nodes reached in
+-- the current and previous tick are tracked, so per-tick bookkeeping scales with the
+-- active branch rather than with the size of the tree.
 type TreeContext = {
-	nodes: { FlatNode },
-	-- Sorted (ascending) node indices for task nodes that have an onExit callback.
-	-- Pre-built once in BT.new(); avoids scanning all nodes every tick.
-	leaveCandidates: { number },
-	-- Tracks which leave candidates have already had onExit fired this tick.
-	-- Keyed by node index. Cleared at the start of each update() call.
-	leaveProcessed: { [number]: boolean },
+	-- Task nodes whose activeThisTick was set during the current tick.
+	reached: { number },
+	-- Task nodes reached in the previous tick.
+	reachedLastTick: { number },
+	-- Sorted subset of reachedLastTick with an onExit callback: the only tasks that can
+	-- be left during the current tick.
+	exitCandidates: { number },
+	-- Whether this tick produces a debug snapshot. Finished tasks are then retained even
+	-- without lifecycle hooks, so the snapshot keeps their resolved params.
+	tracing: boolean,
 	-- Optional callback invoked before and after each node is ticked during debug mode.
 	-- Called with (nodeIndex, RUNNING) before entry and (nodeIndex, resultStatus) after.
 	-- Set per-tick by update(); nil when debug is disabled or no callback is provided.
 	debugCallback: DebugCallback?,
 }
 
-local treeRegistry: { [Blackboard]: TreeContext } = setmetatable({} :: { [Blackboard]: TreeContext }, { __mode = "k" })
+type Ticker = (
+	nodeIndex: number,
+	nodes: { FlatNode },
+	childrenData: { number },
+	blackboard: Blackboard,
+	ctx: TreeContext
+) -> Status
 
 -- Builds a nodeStates snapshot table keyed by 1-based DFS index from a flat node array.
 local function buildNodeStates(nodes: { FlatNode }): { [number]: Status }
@@ -272,6 +285,9 @@ type NodeTemplate = {
 	childCount: number,
 	child: number,
 	varScope: { { [string]: any } }?,
+	staticParams: boolean,
+	hasEdgeHooks: boolean,
+	ticker: Ticker,
 }
 
 type CachedTreeStructure = {
@@ -448,6 +464,9 @@ local function buildFlatTree(
 		wasRunning = false,
 		resolvedParams = nil,
 		varScope = nil,
+		staticParams = false,
+		hasEdgeHooks = false,
+		ticker = nil :: any,
 	}
 	table.insert(nodes, node)
 
@@ -520,11 +539,31 @@ local function resetNode(nodeIndex: number, nodes: { FlatNode }, childrenData: {
 	end
 end
 
+local function resolveNodeParams(node: FlatNode, def: TaskDef, blackboard: Blackboard): { [string]: any }
+	local params = def.params :: { [string]: any }
+	local resolved = if node.staticParams
+		then table.clone(params)
+		else resolveTaskParams(params, blackboard, node.varScope)
+	node.resolvedParams = resolved
+	return resolved
+end
+
 local function getTaskResolvedParams(node: FlatNode, def: TaskDef, blackboard: Blackboard): { [string]: any }
-	if node.resolvedParams == nil then
-		node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard, node.varScope)
+	local resolved = node.resolvedParams
+	if resolved == nil then
+		return resolveNodeParams(node, def, blackboard)
 	end
-	return node.resolvedParams
+	return resolved
+end
+
+local function exitLeftTask(node: FlatNode, blackboard: Blackboard)
+	local def = node.definition :: TaskDef
+	local params = getTaskResolvedParams(node, def, blackboard)
+	if def.module.onExit then
+		def.module.onExit(blackboard, params)
+	end
+	node.resolvedParams = nil
+	node.activeLastTick = false
 end
 
 local function stopNode(nodeIndex: number, nodes: { FlatNode }, childrenData: { number }, blackboard: Blackboard)
@@ -561,63 +600,58 @@ end
 -- itself terminates. Without this, the leave-detection would see the finished
 -- child as "not reached this tick" and fire its onExit prematurely, mid-parallel.
 -- Only nodes that were genuinely active last tick are retained, so branches that
--- were never entered (e.g. an untaken selector child) are left untouched.
-local function retainActiveSubtree(nodeIndex: number, nodes: { FlatNode }, childrenData: { number })
+-- were never entered (e.g. an untaken selector child) are left untouched. Retention
+-- only matters to onEnter/onExit and to debug snapshots, so subtrees without those
+-- hooks are skipped unless the tree is tracing.
+local function retainActiveSubtree(nodeIndex: number, nodes: { FlatNode }, childrenData: { number }, ctx: TreeContext)
 	local node = nodes[nodeIndex]
-	if node.definition._type == "task" and node.activeLastTick then
+	if not node.hasEdgeHooks and not ctx.tracing then
+		return
+	end
+	if node.definition._type == "task" and node.activeLastTick and not node.activeThisTick then
 		node.activeThisTick = true
+		table.insert(ctx.reached, nodeIndex)
 	end
 	for i = 1, node.childCount do
-		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData)
+		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData, ctx)
 	end
 	if node.child ~= 0 then
-		retainActiveSubtree(node.child, nodes, childrenData)
+		retainActiveSubtree(node.child, nodes, childrenData, ctx)
 	end
 end
 
 -- tickNode is forward-declared so that composite ticker functions can reference it.
 -- It is assigned at the bottom of the ticker block.
-type Ticker = (nodeIndex: number, nodes: { FlatNode }, childrenData: { number }, blackboard: Blackboard) -> Status
 local tickNode: Ticker
 local tickers: { [string]: Ticker } = {}
 
-tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }, blackboard: Blackboard): Status
+tickers["task"] = function(
+	nodeIndex: number,
+	nodes: { FlatNode },
+	_: { number },
+	blackboard: Blackboard,
+	ctx: TreeContext
+): Status
 	local node = nodes[nodeIndex]
 	local def = node.definition :: TaskDef
 	local mod = def.module
 	local taskParams: { [string]: any }
 
-	-- Capture the per-tree tick context before mod.run() can yield.
-	-- If another tree's update() runs during a yield it will overwrite treeRegistry[blackboard]
-	-- for that tree's blackboard, but our local reference remains valid.
-	local ctx = treeRegistry[blackboard]
-
 	if not node.activeThisTick then
-		if not node.wasRunning then
-			node.resolvedParams = resolveTaskParams(def.params :: { [string]: any }, blackboard, node.varScope)
-		end
-		taskParams = getTaskResolvedParams(node, def, blackboard)
+		taskParams = if node.wasRunning
+			then getTaskResolvedParams(node, def, blackboard)
+			else resolveNodeParams(node, def, blackboard)
 
 		-- Before entering this task, fire onExit for any earlier task nodes (lower DFS index)
 		-- that were active last tick but have been skipped this tick. This guarantees the
 		-- previous task's onExit fires before the incoming task's onEnter.
-		if ctx then
-			for _, candidateIdx in ctx.leaveCandidates do
-				if candidateIdx >= nodeIndex then
-					break
-				end
-				if not ctx.leaveProcessed[candidateIdx] then
-					local candidate = ctx.nodes[candidateIdx]
-					if candidate.activeLastTick and not candidate.activeThisTick then
-						local candidateDef = candidate.definition :: TaskDef
-						local candidateParams = getTaskResolvedParams(candidate, candidateDef, blackboard)
-						if candidateDef.module.onExit then
-							candidateDef.module.onExit(blackboard, candidateParams)
-						end
-						candidate.resolvedParams = nil
-						ctx.leaveProcessed[candidateIdx] = true
-					end
-				end
+		for _, candidateIdx in ctx.exitCandidates do
+			if candidateIdx >= nodeIndex then
+				break
+			end
+			local candidate = nodes[candidateIdx]
+			if candidate.activeLastTick and not candidate.activeThisTick then
+				exitLeftTask(candidate, blackboard)
 			end
 		end
 
@@ -627,6 +661,7 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 			end
 		end
 		node.activeThisTick = true
+		table.insert(ctx.reached, nodeIndex)
 	else
 		taskParams = getTaskResolvedParams(node, def, blackboard)
 	end
@@ -654,7 +689,13 @@ tickers["task"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }
 	return status
 end
 
-tickers["condition"] = function(nodeIndex: number, nodes: { FlatNode }, _: { number }, blackboard: Blackboard): Status
+tickers["condition"] = function(
+	nodeIndex: number,
+	nodes: { FlatNode },
+	_: { number },
+	blackboard: Blackboard,
+	_ctx: TreeContext
+): Status
 	local node = nodes[nodeIndex]
 	local def = node.definition :: ConditionDef
 	local status: Status = if def.check(blackboard) then SUCCESS else FAILURE
@@ -668,7 +709,8 @@ tickers["sequence"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 
@@ -678,12 +720,12 @@ tickers["sequence"] = function(
 	-- does not fire their onExit mid-sequence (mirrors the retention the parallel
 	-- ticker applies to its finished children).
 	for i = 1, node.activeChildIndex - 1 do
-		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData)
+		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData, ctx)
 	end
 
 	while node.activeChildIndex <= node.childCount do
 		local childIndex = childrenData[node.firstChild + node.activeChildIndex - 1]
-		local status = tickNode(childIndex, nodes, childrenData, blackboard)
+		local status = tickNode(childIndex, nodes, childrenData, blackboard, ctx)
 
 		if status == RUNNING then
 			node.status = RUNNING
@@ -708,7 +750,8 @@ tickers["selector"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 
@@ -718,12 +761,12 @@ tickers["selector"] = function(
 	-- does not fire their onExit mid-selector (mirrors the retention the parallel
 	-- ticker applies to its finished children).
 	for i = 1, node.activeChildIndex - 1 do
-		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData)
+		retainActiveSubtree(childrenData[node.firstChild + i - 1], nodes, childrenData, ctx)
 	end
 
 	while node.activeChildIndex <= node.childCount do
 		local childIndex = childrenData[node.firstChild + node.activeChildIndex - 1]
-		local status = tickNode(childIndex, nodes, childrenData, blackboard)
+		local status = tickNode(childIndex, nodes, childrenData, blackboard, ctx)
 
 		if status == RUNNING then
 			node.status = RUNNING
@@ -748,7 +791,8 @@ tickers["parallel"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 	local def = node.definition :: ParallelDef
@@ -762,7 +806,7 @@ tickers["parallel"] = function(
 	for i = 1, node.childCount do
 		local childIndex = childrenData[node.firstChild + i - 1]
 		if nodes[childIndex].status ~= RUNNING then
-			retainActiveSubtree(childIndex, nodes, childrenData)
+			retainActiveSubtree(childIndex, nodes, childrenData, ctx)
 		end
 	end
 
@@ -770,7 +814,7 @@ tickers["parallel"] = function(
 		local childIndex = childrenData[node.firstChild + i - 1]
 		local child = nodes[childIndex]
 		if child.status == RUNNING then
-			tickNode(childIndex, nodes, childrenData, blackboard)
+			tickNode(childIndex, nodes, childrenData, blackboard, ctx)
 		end
 		if child.status == SUCCESS then
 			successCount += 1
@@ -804,10 +848,11 @@ tickers["invert"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
-	local status = tickNode(node.child, nodes, childrenData, blackboard)
+	local status = tickNode(node.child, nodes, childrenData, blackboard, ctx)
 	local result: Status = if status == SUCCESS then FAILURE elseif status == FAILURE then SUCCESS else RUNNING
 	node.status = result
 	return result
@@ -818,14 +863,15 @@ tickers["alwaysSucceed"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 	if node.child == 0 then
 		node.status = SUCCESS
 		return SUCCESS
 	end
-	local status = tickNode(node.child, nodes, childrenData, blackboard)
+	local status = tickNode(node.child, nodes, childrenData, blackboard, ctx)
 	if status == RUNNING then
 		node.status = RUNNING
 		return RUNNING
@@ -839,14 +885,15 @@ tickers["alwaysFail"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 	if node.child == 0 then
 		node.status = FAILURE
 		return FAILURE
 	end
-	local status = tickNode(node.child, nodes, childrenData, blackboard)
+	local status = tickNode(node.child, nodes, childrenData, blackboard, ctx)
 	if status == RUNNING then
 		node.status = RUNNING
 		return RUNNING
@@ -860,11 +907,12 @@ tickers["repeat"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 	local def = node.definition :: RepeatDef
-	local status = tickNode(node.child, nodes, childrenData, blackboard)
+	local status = tickNode(node.child, nodes, childrenData, blackboard, ctx)
 
 	if status == FAILURE then
 		node.iterationCount = 0
@@ -891,11 +939,12 @@ tickers["retry"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 	local def = node.definition :: RetryDef
-	local status = tickNode(node.child, nodes, childrenData, blackboard)
+	local status = tickNode(node.child, nodes, childrenData, blackboard, ctx)
 
 	if status == SUCCESS then
 		node.iterationCount = 0
@@ -923,7 +972,8 @@ tickers["randomSelector"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
 
@@ -953,7 +1003,7 @@ tickers["randomSelector"] = function(
 	end
 
 	local childIndex = childrenData[node.firstChild + node.activeChildIndex - 1]
-	local status = tickNode(childIndex, nodes, childrenData, blackboard)
+	local status = tickNode(childIndex, nodes, childrenData, blackboard, ctx)
 
 	if status ~= RUNNING then
 		node.started = false
@@ -969,33 +1019,63 @@ tickers["subtree"] = function(
 	nodeIndex: number,
 	nodes: { FlatNode },
 	childrenData: { number },
-	blackboard: Blackboard
+	blackboard: Blackboard,
+	ctx: TreeContext
 ): Status
 	local node = nodes[nodeIndex]
-	local status = tickNode(node.child, nodes, childrenData, blackboard)
+	local status = tickNode(node.child, nodes, childrenData, blackboard, ctx)
 	node.status = status
 	return status
 end
 
-tickNode = function(nodeIndex: number, nodes: { FlatNode }, childrenData: { number }, blackboard: Blackboard): Status
-	local node = nodes[nodeIndex]
-	local ticker = tickers[node.definition._type]
-	assert(ticker ~= nil, "Unknown behavior tree node type: " .. node.definition._type)
-
-	local ctx = treeRegistry[blackboard]
-	local cb = if ctx then ctx.debugCallback else nil
-
+tickNode = function(
+	nodeIndex: number,
+	nodes: { FlatNode },
+	childrenData: { number },
+	blackboard: Blackboard,
+	ctx: TreeContext
+): Status
+	local ticker = nodes[nodeIndex].ticker
+	local cb = ctx.debugCallback
 	if cb then
 		cb(nodeIndex, RUNNING)
-	end
-
-	local result = ticker(nodeIndex, nodes, childrenData, blackboard)
-
-	if cb then
+		local result = ticker(nodeIndex, nodes, childrenData, blackboard, ctx)
 		cb(nodeIndex, result)
+		return result
 	end
+	return ticker(nodeIndex, nodes, childrenData, blackboard, ctx)
+end
 
-	return result
+-- Marks every node whose subtree contains a task with onEnter or onExit.
+local function markEdgeHooks(nodeIndex: number, nodes: { FlatNode }, childrenData: { number }): boolean
+	local node = nodes[nodeIndex]
+	local hooked = false
+	if node.definition._type == "task" then
+		local mod = (node.definition :: TaskDef).module
+		hooked = mod.onEnter ~= nil or mod.onExit ~= nil
+	end
+	for i = 1, node.childCount do
+		if markEdgeHooks(childrenData[node.firstChild + i - 1], nodes, childrenData) then
+			hooked = true
+		end
+	end
+	if node.child ~= 0 and markEdgeHooks(node.child, nodes, childrenData) then
+		hooked = true
+	end
+	node.hasEdgeHooks = hooked
+	return hooked
+end
+
+local function hasStaticParams(params: { [string]: any }): boolean
+	if getmetatable(params :: any) ~= nil then
+		return false
+	end
+	for _, value in params do
+		if isParamBinding(value) or isParamCalculation(value) or isParamVar(value) then
+			return false
+		end
+	end
+	return true
 end
 
 -- Public API
@@ -1013,7 +1093,11 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 		local childrenData: { number } = {}
 		local rootIndex = buildFlatTree(definition, templateNodes, childrenData, {})
 		local nodeTemplates: { NodeTemplate } = {}
+		markEdgeHooks(rootIndex, templateNodes, childrenData)
 		for i, node in templateNodes do
+			local nodeType = node.definition._type
+			local ticker = tickers[nodeType]
+			assert(ticker ~= nil, `Unknown behavior tree node type: {nodeType}`)
 			nodeTemplates[i] = {
 				id = node.id,
 				definition = node.definition,
@@ -1021,6 +1105,9 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 				childCount = node.childCount,
 				child = node.child,
 				varScope = node.varScope,
+				staticParams = nodeType == "task" and hasStaticParams((node.definition :: TaskDef).params),
+				hasEdgeHooks = node.hasEdgeHooks,
+				ticker = ticker,
 			}
 		end
 		cached = { childrenData = childrenData, nodeTemplates = nodeTemplates, rootIndex = rootIndex }
@@ -1046,23 +1133,17 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			wasRunning = false,
 			resolvedParams = nil,
 			varScope = template.varScope,
+			staticParams = template.staticParams,
+			hasEdgeHooks = template.hasEdgeHooks,
+			ticker = template.ticker,
 		}
 	end
 
-	-- Pre-build the sorted list of task node indices that have an onExit callback.
-	-- Kept outside of the tick loop to avoid allocating on every frame.
-	local leaveCandidates: { number } = {}
-	for i = 1, #nodes do
-		local n = nodes[i]
-		if n.definition._type == "task" and (n.definition :: TaskDef).module.onExit then
-			table.insert(leaveCandidates, i)
-		end
-	end
-
-	treeRegistry[blackboard] = {
-		nodes = nodes,
-		leaveCandidates = leaveCandidates,
-		leaveProcessed = {},
+	local ctx: TreeContext = {
+		reached = {},
+		reachedLastTick = {},
+		exitCandidates = {},
+		tracing = false,
 		debugCallback = nil,
 	}
 
@@ -1087,15 +1168,13 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 				node.activeThisTick = false
 			end
 		end
+		table.clear(ctx.reached)
+		table.clear(ctx.reachedLastTick)
+		table.clear(ctx.exitCandidates)
+		ctx.debugCallback = nil
 		lastStatus = RUNNING
 		if resumeAfterReset then
 			paused = false
-		end
-
-		local ctx = treeRegistry[blackboard]
-		if ctx then
-			table.clear(ctx.leaveProcessed)
-			ctx.debugCallback = nil
 		end
 	end
 
@@ -1126,57 +1205,55 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 
 			tickCount += 1
 
-			local ctx = treeRegistry[blackboard]
-			if ctx then
-				table.clear(ctx.leaveProcessed)
-				-- Store the callback so tickNode can invoke it around each node.
-				-- Only set while debug snapshots are enabled; otherwise the callback is ignored.
-				if tracing then
-					ctx.debugCallback = debugCallback
-				end
-			end
+			-- Store the callback so tickNode can invoke it around each node.
+			-- Only set while debug snapshots are enabled; otherwise the callback is ignored.
+			ctx.tracing = tracing
+			ctx.debugCallback = if tracing then debugCallback else nil
 
-			local status = tickNode(rootIndex, nodes, childrenData, blackboard)
+			local status = tickNode(rootIndex, nodes, childrenData, blackboard, ctx)
 
-			-- Post-tick fallback: fire onExit for any leave candidates that were active last
+			-- Post-tick fallback: fire onExit for any exit candidates that were active last
 			-- tick but were never visited at all this tick (e.g. in an entirely skipped branch).
 			-- The inline path in tickers["task"] already handles candidates with lower DFS indices
 			-- than the task that ran; this handles the rest.
-			if ctx then
-				for _, candidateIdx in ctx.leaveCandidates do
-					if not ctx.leaveProcessed[candidateIdx] then
-						local n = nodes[candidateIdx]
-						if n.activeLastTick and not n.activeThisTick then
-							local def = n.definition :: TaskDef
-							local params = getTaskResolvedParams(n, def, blackboard)
-							if def.module.onExit then
-								def.module.onExit(blackboard, params)
-							end
-							n.resolvedParams = nil
-							ctx.leaveProcessed[candidateIdx] = true
-						end
-					end
+			local exitCandidates = ctx.exitCandidates
+			for _, candidateIdx in exitCandidates do
+				local n = nodes[candidateIdx]
+				if n.activeLastTick and not n.activeThisTick then
+					exitLeftTask(n, blackboard)
 				end
 			end
 
-			-- Advance the per-tick tracking flags for all task nodes.
-			for i = 1, #nodes do
+			-- Advance the per-tick tracking flags of the task nodes reached last tick or this tick.
+			local reachedLastTick = ctx.reachedLastTick
+			for _, i in reachedLastTick do
 				local n = nodes[i]
-				if n.definition._type == "task" then
-					if not n.activeThisTick then
-						n.resolvedParams = nil
-					end
-					n.activeLastTick = n.activeThisTick
-					n.activeThisTick = false
+				if not n.activeThisTick then
+					n.resolvedParams = nil
+					n.activeLastTick = false
 				end
 			end
+			table.clear(reachedLastTick)
+			table.clear(exitCandidates)
+			local reached = ctx.reached
+			for _, i in reached do
+				local n = nodes[i]
+				n.activeLastTick = true
+				n.activeThisTick = false
+				if (n.definition :: TaskDef).module.onExit then
+					table.insert(exitCandidates, i)
+				end
+			end
+			if #exitCandidates > 1 then
+				table.sort(exitCandidates)
+			end
+			ctx.reachedLastTick = reached
+			ctx.reached = reachedLastTick
 
 			lastStatus = status
 
 			-- Clear the per-tick debug callback so it doesn't leak into future ticks.
-			if ctx then
-				ctx.debugCallback = nil
-			end
+			ctx.debugCallback = nil
 
 			if tracing then
 				return status,
