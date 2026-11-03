@@ -2679,6 +2679,143 @@ return function(tiniest: tiniest_actual)
 	end)
 
 	------------------------------------------------------------------------
+	-- task state
+	------------------------------------------------------------------------
+
+	describe("task state", function()
+		local function countingStateful(): BT.BTreeTask
+			return {
+				stateful = true,
+				run = function(_, _, state)
+					state.count = (state.count or 0) + 1
+					return SUCCESS
+				end,
+			}
+		end
+
+		test("a task that is not stateful receives nil state", function()
+			local received: any = "unset"
+			BT.new(
+				BT.task({
+					run = function(_, _, state)
+						received = state
+						return SUCCESS
+					end,
+				}),
+				{}
+			):update()
+			expect(received).never_exists()
+		end)
+
+		test("every hook of one node receives the same state table", function()
+			local seen: { any } = {}
+			local function record(_, _, state)
+				table.insert(seen, state)
+			end
+			local tree = BT.new(
+				BT.task({
+					stateful = true,
+					onEnter = record,
+					onStart = record,
+					run = function(_, _, state)
+						record(nil, nil, state)
+						return SUCCESS
+					end,
+					onEnd = record,
+					onExit = record,
+				}),
+				{}
+			)
+			tree:update()
+			tree:stop()
+			expect(#seen).is(5)
+			expect(type(seen[1])).is("table")
+			for _, state in seen do
+				expect(state).is(seen[1])
+			end
+		end)
+
+		test("state persists across executions of the same node", function()
+			local received: any = nil
+			local module = countingStateful()
+			local run = module.run :: any
+			module.run = function(bb, params, state)
+				received = state
+				return run(bb, params, state)
+			end
+			local tree = BT.new(BT.task(module), {})
+			tree:update()
+			tree:update()
+			tree:update()
+			expect(received.count).is(3)
+		end)
+
+		test("two nodes running the same module in a parallel keep separate state", function()
+			local countdown: BT.BTreeTask = {
+				stateful = true,
+				onStart = function(_, _, state)
+					state.ticks = 0
+				end,
+				run = function(_, params, state)
+					state.ticks += 1
+					return if state.ticks >= params.ticks then SUCCESS else RUNNING
+				end,
+			}
+			local tree = BT.new(
+				BT.parallel({
+					BT.task(countdown, { ticks = 2 }),
+					BT.task(countdown, { ticks = 3 }),
+				}),
+				{}
+			)
+			expect(tree:update()).is(RUNNING)
+			expect(tree:update()).is(RUNNING)
+			expect(tree:update()).is(SUCCESS)
+		end)
+
+		test("each tree instance gets its own state", function()
+			local states: { [any]: boolean } = {}
+			local module = countingStateful()
+			local run = module.run :: any
+			module.run = function(bb, params, state)
+				states[state] = true
+				return run(bb, params, state)
+			end
+			local def = BT.task(module)
+			BT.new(def, {}):update()
+			BT.new(def, {}):update()
+			local count = 0
+			for state in states do
+				count += 1
+				expect(state.count).is(1)
+			end
+			expect(count).is(2)
+		end)
+
+		test("tree:reset() clears state after the cleanup hooks have seen it", function()
+			local countAtExit: number? = nil
+			local received: any = nil
+			local module = countingStateful()
+			local run = module.run :: any
+			module.run = function(bb, params, state)
+				received = state
+				return run(bb, params, state)
+			end
+			module.onExit = function(_, _, state)
+				countAtExit = state.count
+			end
+			local tree = BT.new(BT.task(module), {})
+			tree:update()
+			tree:update()
+			tree:reset()
+			expect(countAtExit).is(2)
+			expect(received.count).never_exists()
+			tree:update()
+			expect(received.count).is(1)
+		end)
+	end)
+
+	------------------------------------------------------------------------
 	-- pause / resume
 	------------------------------------------------------------------------
 

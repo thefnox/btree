@@ -8,6 +8,7 @@ A behavior tree library for Roblox, written in Luau.
 - Flat array-based runtime — no nested table allocations during ticks
 - Full Luau strict-mode types
 - Binding-based task params via `BT.bind(...)` and `BT.calc(...)`
+- Opt-in per-node task state (`stateful = true`)
 - Subtree inlining — subtrees are merged into the parent flat array at build time
 - Parameterizable subtrees via tree vars (`BT.var(...)` with per-include overrides and defaults)
 - Pause/resume support
@@ -116,6 +117,27 @@ return {
 | `onStart` | When a fresh execution of the task begins |
 | `onEnd` | When the task exits with `SUCCESS` or `FAILURE`. An interrupted mid-execution task ends as `FAILURE`, firing `onEnd` before `onExit` |
 | `run` | Every tick while active — return `RUNNING` to stay active, `FAILURE` to fail, or nothing / `SUCCESS` to succeed |
+
+#### Per-node state
+
+Set `stateful = true` on a task module to give every node that runs it a `state` table of its own, passed to each hook as the third argument. The table belongs to one node in one tree instance: two nodes running the same module (for example two waits in a parallel) never share one, and neither do two trees built from the same definition. It is kept between executions, so reset per-execution fields in `onStart`. `tree:stop()`, `tree:reset()` and `tree:destroy()` clear it after the hooks they fire have run. Modules without `stateful` receive `nil`.
+
+```lua
+-- Tasks/Wait.lua
+return {
+    stateful = true,
+
+    onStart = function(_, params, state)
+        state.waitUntil = os.clock() + params.time
+    end,
+
+    run = function(_, _, state): BT.Status?
+        return if os.clock() >= state.waitUntil then BT.SUCCESS else BT.RUNNING
+    end,
+} :: BT.Task
+```
+
+Treat `params` as read-only. Anything a task needs to remember belongs in `state` or on the blackboard.
 
 ### Subtrees
 

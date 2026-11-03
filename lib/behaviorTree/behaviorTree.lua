@@ -74,42 +74,48 @@ export type ParamVar = {
 }
 
 -- A task is a module script that returns a value of this type.
+-- Every hook receives `(blackboard, params, state)`. `state` is nil unless the module sets `stateful`.
 export type BTreeTask = {
 	-- Optional legacy schema kept for compatibility. It is no longer enforced.
 	params: ParamTypes?,
+	-- When true, each node running this module gets its own `state` table per tree instance,
+	-- kept across executions and cleared by stop/reset/destroy. Two nodes running the same
+	-- module (for example in a parallel) never share one.
+	stateful: boolean?,
 	-- Fires the first time a task is reached in a tick after not being reached in the previous tick.
 	-- Does not re-fire if the task continues to be reached every tick.
-	onEnter: ((blackboard: Blackboard, params: any) -> ())?,
+	onEnter: ((blackboard: Blackboard, params: any, state: any) -> ())?,
 	-- Fires when the branch containing this task is left: the tree takes a different
 	-- branch, or the tree is stopped/reset/destroyed. A task that already completed
 	-- inside a still-running sequence, selector, or parallel is retained as part of
 	-- that composite's active branch, so it does not exit mid-execution.
-	onExit: ((blackboard: Blackboard, params: any) -> ())?,
+	onExit: ((blackboard: Blackboard, params: any, state: any) -> ())?,
 	-- Called once when the task starts a fresh execution. Not called when resuming after RUNNING.
-	onStart: ((blackboard: Blackboard, params: any) -> ())?,
+	onStart: ((blackboard: Blackboard, params: any, state: any) -> ())?,
 	-- Called once when the task exits with SUCCESS or FAILURE (not called when returning
 	-- RUNNING). A task interrupted mid-execution (via stop/reset/destroy or a terminating
 	-- parallel) is ended as FAILURE, firing onEnd before onExit.
-	onEnd: ((blackboard: Blackboard, params: any) -> ())?,
+	onEnd: ((blackboard: Blackboard, params: any, state: any) -> ())?,
 	-- Main task body.
 	-- Return BT.FAILURE to fail, or return nothing / BT.SUCCESS to succeed.
-	run: ((blackboard: Blackboard, params: any) -> Status?)?,
+	run: ((blackboard: Blackboard, params: any, state: any) -> Status?)?,
 	-- Optional name
 	name: string?,
 }
 
 type TaskModule = {
 	params: { [string]: string }?,
-	onEnter: ((blackboard: Blackboard, params: any) -> ())?,
-	onExit: ((blackboard: Blackboard, params: any) -> ())?,
+	stateful: boolean?,
+	onEnter: ((blackboard: Blackboard, params: any, state: any) -> ())?,
+	onExit: ((blackboard: Blackboard, params: any, state: any) -> ())?,
 	-- Called once when the task starts a fresh execution. Not called when resuming after RUNNING.
-	onStart: ((blackboard: Blackboard, params: any) -> ())?,
+	onStart: ((blackboard: Blackboard, params: any, state: any) -> ())?,
 	-- Called once when the task exits with SUCCESS or FAILURE (not called when returning
 	-- RUNNING). Interrupted tasks are ended as FAILURE, firing onEnd before onExit.
-	onEnd: ((blackboard: Blackboard, params: any) -> ())?,
+	onEnd: ((blackboard: Blackboard, params: any, state: any) -> ())?,
 	-- Main task body.
 	-- Return BT.FAILURE to fail, or return nothing / BT.SUCCESS to succeed.
-	run: (blackboard: Blackboard, params: any) -> Status?,
+	run: (blackboard: Blackboard, params: any, state: any) -> Status?,
 }
 
 -- Declarative node definition types. Build trees using the BT.sequence(), BT.task(), etc. helpers.
@@ -173,6 +179,7 @@ type FlatNode = {
 	activeThisTick: boolean, -- task: has this node been reached in the current tick?
 	wasRunning: boolean, -- task: did the previous execution of this node return RUNNING?
 	resolvedParams: { [string]: any }?, -- task: params resolved once for the current activation
+	state: { [string]: any }?, -- task: the module's per-node state, when it is stateful
 	varScope: { { [string]: any } }?, -- task: enclosing subtree vars tables, innermost first
 	staticParams: boolean, -- task: no param is a BT.bind/BT.calc/BT.var, so resolving is a shallow copy
 	hasEdgeHooks: boolean, -- whether this subtree contains a task with onEnter or onExit
@@ -286,6 +293,7 @@ type NodeTemplate = {
 	child: number,
 	varScope: { { [string]: any } }?,
 	staticParams: boolean,
+	stateful: boolean,
 	hasEdgeHooks: boolean,
 	ticker: Ticker,
 }
@@ -463,6 +471,7 @@ local function buildFlatTree(
 		activeThisTick = false,
 		wasRunning = false,
 		resolvedParams = nil,
+		state = nil,
 		varScope = nil,
 		staticParams = false,
 		hasEdgeHooks = false,
@@ -560,7 +569,7 @@ local function exitLeftTask(node: FlatNode, blackboard: Blackboard)
 	local def = node.definition :: TaskDef
 	local params = getTaskResolvedParams(node, def, blackboard)
 	if def.module.onExit then
-		def.module.onExit(blackboard, params)
+		def.module.onExit(blackboard, params, node.state)
 	end
 	node.resolvedParams = nil
 	node.activeLastTick = false
@@ -578,11 +587,11 @@ local function stopNode(nodeIndex: number, nodes: { FlatNode }, childrenData: { 
 			node.status = FAILURE
 			node.wasRunning = false
 			if def.module.onEnd then
-				def.module.onEnd(blackboard, params)
+				def.module.onEnd(blackboard, params, node.state)
 			end
 		end
 		if def.module.onExit then
-			def.module.onExit(blackboard, params)
+			def.module.onExit(blackboard, params, node.state)
 		end
 		node.resolvedParams = nil
 	end
@@ -635,6 +644,7 @@ tickers["task"] = function(
 	local node = nodes[nodeIndex]
 	local def = node.definition :: TaskDef
 	local mod = def.module
+	local state = node.state
 	local taskParams: { [string]: any }
 
 	if not node.activeThisTick then
@@ -657,7 +667,7 @@ tickers["task"] = function(
 
 		if not node.activeLastTick then
 			if mod.onEnter then
-				mod.onEnter(blackboard, taskParams)
+				mod.onEnter(blackboard, taskParams, state)
 			end
 		end
 		node.activeThisTick = true
@@ -670,15 +680,15 @@ tickers["task"] = function(
 	-- It does not fire when the task is resuming after returning RUNNING.
 	if not node.wasRunning then
 		if mod.onStart then
-			mod.onStart(blackboard, taskParams)
+			mod.onStart(blackboard, taskParams, state)
 		end
 	end
 
 	-- run() may yield freely; tree:update() is assumed to be called inside a task.
-	local result = mod.run(blackboard, taskParams)
+	local result = mod.run(blackboard, taskParams, state)
 
 	if mod.onEnd and result ~= RUNNING then
-		mod.onEnd(blackboard, taskParams)
+		mod.onEnd(blackboard, taskParams, state)
 	end
 
 	-- RUNNING passes through; explicit FAILURE fails; anything else (including nil) succeeds.
@@ -1106,6 +1116,7 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 				child = node.child,
 				varScope = node.varScope,
 				staticParams = nodeType == "task" and hasStaticParams((node.definition :: TaskDef).params),
+				stateful = nodeType == "task" and (node.definition :: TaskDef).module.stateful == true,
 				hasEdgeHooks = node.hasEdgeHooks,
 				ticker = ticker,
 			}
@@ -1132,6 +1143,7 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			activeThisTick = false,
 			wasRunning = false,
 			resolvedParams = nil,
+			state = if template.stateful then {} else nil,
 			varScope = template.varScope,
 			staticParams = template.staticParams,
 			hasEdgeHooks = template.hasEdgeHooks,
@@ -1166,6 +1178,9 @@ function BehaviorTree.new(definition: NodeDefinition, blackboard: Blackboard, de
 			if node.definition._type == "task" then
 				node.activeLastTick = false
 				node.activeThisTick = false
+				if node.state then
+					table.clear(node.state)
+				end
 			end
 		end
 		table.clear(ctx.reached)
